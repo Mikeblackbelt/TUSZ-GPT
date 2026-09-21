@@ -16,6 +16,7 @@ LabeledWindows    -- the labeled rows of the master CSV (TERM channel, is_valid)
 from __future__ import annotations
 
 import bisect
+import json
 import os
 import re
 from collections import OrderedDict
@@ -70,7 +71,17 @@ class SessionStore:
             self._cache.move_to_end(session_key)
             return self._cache[session_key]
         tbl = pq.read_table(self.path(session_key), columns=self.channels)
-        arr = np.stack([tbl.column(i).to_numpy(zero_copy_only=False).astype(np.float32) for i in range(tbl.num_columns)], axis=0)
+        # int16 + per-channel scale (EDF-style storage written by the preprocessing
+        # repo's checkpoint_io / tools/shrink_checkpoints.py) or plain float columns
+        meta = tbl.schema.metadata or {}
+        scales = json.loads(meta[b"eeg_scales_json"].decode()) if b"eeg_scales_json" in meta else {}
+        cols = []
+        for name, col in zip(tbl.column_names, tbl.columns):
+            v = col.to_numpy(zero_copy_only=False)
+            if v.dtype == np.int16 or name in scales:
+                v = v.astype(np.float32) * np.float32(scales.get(name, float(meta.get(f"eeg_scale_{name}".encode(), b"1").decode())))
+            cols.append(v.astype(np.float32, copy=False))
+        arr = np.stack(cols, axis=0)
         if self.channels is None:
             self.channels = list(tbl.column_names)
         self._cache[session_key] = arr
