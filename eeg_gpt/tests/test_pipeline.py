@@ -27,6 +27,7 @@ import torch
 from eeg_gpt.data.datasets import LabeledWindows, PretrainSessions, patient_id, session_number
 from eeg_gpt.data.tokenizer import AmplitudeTokenizer
 from eeg_gpt.models.gpt import EEGGPT, SeizureModel, gpt_loss
+from eeg_gpt.training import finetune, pretrain
 
 FS, C = 256, 20
 
@@ -67,6 +68,17 @@ def make_corpus(root, n_patients=4, sessions_per_patient=2, dur_s=900.0, seed=0)
             for a in np.arange(onset, onset + dur - 4, 4.0): add(typ, a, a + 4.0, status=-1)
     pd.DataFrame(rows).to_csv(os.path.join(root, "master.csv"), index=False)
     return ck, os.path.join(root, "master.csv")
+
+
+def test_training_loader_speed_settings():
+    dl = pretrain.make_loader(list(range(32)), batch_size=8, num_workers=2, drop_last=True)
+    assert dl.pin_memory is torch.cuda.is_available()
+    assert dl.persistent_workers is True
+    assert dl.prefetch_factor == 2
+    dl2 = finetune.make_loader(list(range(32)), batch_size=8, num_workers=2, drop_last=True)
+    assert dl2.pin_memory is torch.cuda.is_available()
+    assert dl2.persistent_workers is True
+    assert dl2.prefetch_factor == 2
 
 
 def test_tokenizer():

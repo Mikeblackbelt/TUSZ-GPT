@@ -138,12 +138,25 @@ def binary_targets(batch, label):
     return batch["horizon_pos"] if label == "horizon" else batch["occ"]
 
 
+def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False):
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
+    if batch_sampler is not None:
+        return DataLoader(dataset, batch_sampler=batch_sampler, **kwargs)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, **kwargs)
+
+
 def run_eval(model, loader, args, device, ds, do_baseline=False, train_loader=None):
     model.eval()
     S, Y, V, SID, TIME, TP, TT, TI, Z = [], [], [], [], [], [], [], [], []
     with torch.no_grad():
         for b in loader:
-            out = model(b["tokens"].to(device))
+            out = model(b["tokens"].to(device, non_blocking=torch.cuda.is_available()))
             S.append(torch.sigmoid(out["binary_logit"].float()).cpu()); Y.append(binary_targets(b, args.label)); V.append(b["occ_valid"])
             SID.append(b["session_idx"]); TIME.append(b["row_idx"].float()); TP.append(out["type_logits"].argmax(-1).cpu())
             TT.append(b["type_idx"]); TI.append(b["is_ictal"])
@@ -213,9 +226,9 @@ def main(argv=None):
         for p_ in model.encoder.backbone.parameters():
             p_.requires_grad = False
     sampler = BalancedBatchSampler(tr.df, args.batch_size, args.min_ictal_per_batch, seed=args.seed)
-    tl = DataLoader(tr, batch_sampler=sampler, num_workers=args.num_workers)
-    el = DataLoader(ev, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    tl_eval = DataLoader(tr, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers) if args.baseline else None
+    tl = make_loader(tr, batch_sampler=sampler, num_workers=args.num_workers)
+    el = make_loader(ev, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False)
+    tl_eval = make_loader(tr, batch_size=args.batch_size, num_workers=args.num_workers, shuffle=False) if args.baseline else None
     if args.eval_only:
         if args.load:
             model.load_state_dict(torch.load(args.load, map_location=device)["model"])
@@ -242,10 +255,10 @@ def main(argv=None):
         for i, b in enumerate(tl):
             if args.steps_per_epoch and i >= args.steps_per_epoch:
                 break
-            tokens = b["tokens"].to(device)
+            tokens = b["tokens"].to(device, non_blocking=torch.cuda.is_available())
             with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
                 out = model(tokens)
-            y = binary_targets(b, args.label).to(device); v = b["occ_valid"].to(device) > 0.5
+            y = binary_targets(b, args.label).to(device, non_blocking=torch.cuda.is_available()); v = b["occ_valid"].to(device, non_blocking=torch.cuda.is_available()) > 0.5
             lb = F.binary_cross_entropy_with_logits(out["binary_logit"].float()[v], y[v], pos_weight=pos_weight) if v.any() else out["binary_logit"].sum() * 0
             ti = b["type_idx"].to(device); ii = b["is_ictal"].to(device) > 0.5
             wrow = torch.where(ii, 1.0, args.type_preictal_weight) * (ti >= 0).float()

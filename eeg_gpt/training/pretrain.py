@@ -81,6 +81,19 @@ def lr_at(step, args):
     return 1e-6 + 0.5 * (args.lr - 1e-6) * (1 + math.cos(math.pi * min(1.0, t)))
 
 
+def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False):
+    kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
+    if batch_sampler is not None:
+        return DataLoader(dataset, batch_sampler=batch_sampler, **kwargs)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last, **kwargs)
+
+
 @torch.no_grad()
 def evaluate(model, loader, tok, args, device, n_batches):
     model.eval(); agg = {}
@@ -109,8 +122,8 @@ def main(argv=None):
     per_epoch = args.steps * args.batch_size * args.accum
     tr = PretrainSessions(args.checkpoint_dir, args.block_size, per_epoch, args.stage, args.cache_capacity, tok, train_s, args.norm_stats, args.seed)
     va = PretrainSessions(args.checkpoint_dir, args.block_size, args.val_batches * args.batch_size, args.stage, args.cache_capacity, tok, val_s, args.norm_stats, args.seed + 1)
-    tl = DataLoader(tr, batch_size=args.batch_size, num_workers=args.num_workers, drop_last=True, persistent_workers=args.num_workers > 0)
-    vl = DataLoader(va, batch_size=args.batch_size, num_workers=min(2, args.num_workers))
+    tl = make_loader(tr, batch_size=args.batch_size, num_workers=args.num_workers, drop_last=True)
+    vl = make_loader(va, batch_size=args.batch_size, num_workers=min(2, args.num_workers), drop_last=False)
     offsets = [int(o) for o in args.pred_offsets.split(",")]
     model = EEGGPT(args.n_levels, args.n_channels, args.d, args.layers, args.heads, args.ffn, args.block_size, args.dropout, offsets).to(device)
     log.info(f"EEGGPT params: {count_params(model) / 1e6:.2f}M | offsets {offsets} | block {args.block_size} | levels {args.n_levels}")
@@ -133,7 +146,7 @@ def main(argv=None):
         for _ in range(args.accum):
             tokens, z, ch = next(it)
             with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
-                out = gpt_loss(model, tokens.to(device), z.to(device), ch.to(device), tok, args.lambda_mse)
+                out = gpt_loss(model, tokens.to(device, non_blocking=torch.cuda.is_available()), z.to(device, non_blocking=torch.cuda.is_available()), ch.to(device, non_blocking=torch.cuda.is_available()), tok, args.lambda_mse)
             scaler.scale(out["loss"] / args.accum).backward()
             for k, v in out.items():
                 agg[k] = agg.get(k, 0.0) + float(v) / args.accum
