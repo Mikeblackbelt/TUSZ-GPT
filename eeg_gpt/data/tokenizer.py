@@ -26,10 +26,11 @@ class AmplitudeTokenizer:
     def __init__(self, n_levels: int = 512, clip_k: float = 5.0):
         self.L = int(n_levels)
         self.k = float(clip_k)
+        self._cached_level_values: dict = {}
 
     # ---- numpy path (loaders) -------------------------------------------------
     def zscore(self, x: np.ndarray, mu=None, sd=None):
-        """x: (C, T). Returns z-scored signal and the stats used."""
+        """x: (..., T). Returns z-scored signal and the stats used."""
         if mu is None:
             mu = x.mean(axis=-1, keepdims=True)
             sd = x.std(axis=-1, keepdims=True) + 1e-8
@@ -41,8 +42,10 @@ class AmplitudeTokenizer:
         return np.floor(u * (self.L - 1)).astype(np.int64)
 
     def encode(self, x: np.ndarray, mu=None, sd=None):
-        z, stats = self.zscore(x.astype(np.float32), mu, sd)
-        return self.quantize_z(z), z.astype(np.float32), stats
+        if x.dtype != np.float32:
+            x = x.astype(np.float32, copy=False)
+        z, stats = self.zscore(x, mu, sd)
+        return self.quantize_z(z), z.astype(np.float32, copy=False), stats
 
     # ---- torch path (model / losses) --------------------------------------------
     def dequantize(self, level: torch.Tensor) -> torch.Tensor:
@@ -52,4 +55,7 @@ class AmplitudeTokenizer:
 
     def level_values(self, device=None) -> torch.Tensor:
         """z value of each of the L levels (bin lower edges), shape (L,)."""
-        return self.dequantize(torch.arange(self.L, device=device))
+        key = str(device)
+        if key not in self._cached_level_values:
+            self._cached_level_values[key] = self.dequantize(torch.arange(self.L, device=device))
+        return self._cached_level_values[key]

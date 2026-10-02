@@ -54,6 +54,7 @@ class SessionStore:
         self.capacity = max(1, int(capacity))
         self.channels = channels
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._n_samples_cache: dict = {}
 
     def path(self, session_key: str) -> str:
         return os.path.join(self.dir, f"{session_key}_{self.stage}.parquet")
@@ -63,25 +64,30 @@ class SessionStore:
         return sorted(f[: -len(suf)] for f in os.listdir(self.dir) if f.endswith(suf))
 
     def n_samples(self, session_key: str) -> int:
-        return pq.ParquetFile(self.path(session_key)).metadata.num_rows
+        if session_key not in self._n_samples_cache:
+            self._n_samples_cache[session_key] = pq.ParquetFile(self.path(session_key), memory_map=True).metadata.num_rows
+        return self._n_samples_cache[session_key]
 
     def get(self, session_key: str) -> np.ndarray:
         """(C, T) float32 array of the whole recording."""
         if session_key in self._cache:
             self._cache.move_to_end(session_key)
             return self._cache[session_key]
-        tbl = pq.read_table(self.path(session_key), columns=self.channels)
+        tbl = pq.read_table(self.path(session_key), columns=self.channels, memory_map=True, use_threads=True)
         # int16 + per-channel scale (EDF-style storage written by the preprocessing
         # repo's checkpoint_io / tools/shrink_checkpoints.py) or plain float columns
         meta = tbl.schema.metadata or {}
         scales = json.loads(meta[b"eeg_scales_json"].decode()) if b"eeg_scales_json" in meta else {}
-        cols = []
-        for name, col in zip(tbl.column_names, tbl.columns):
+        num_cols = tbl.num_columns
+        num_rows = tbl.num_rows
+        arr = np.empty((num_cols, num_rows), dtype=np.float32)
+        for i, (name, col) in enumerate(zip(tbl.column_names, tbl.columns)):
             v = col.to_numpy(zero_copy_only=False)
             if v.dtype == np.int16 or name in scales:
-                v = v.astype(np.float32) * np.float32(scales.get(name, float(meta.get(f"eeg_scale_{name}".encode(), b"1").decode())))
-            cols.append(v.astype(np.float32, copy=False))
-        arr = np.stack(cols, axis=0)
+                scale = np.float32(scales.get(name, float(meta.get(f"eeg_scale_{name}".encode(), b"1").decode())))
+                np.multiply(v, scale, out=arr[i], casting="unsafe")
+            else:
+                arr[i] = v
         if self.channels is None:
             self.channels = list(tbl.column_names)
         self._cache[session_key] = arr
@@ -197,6 +203,50 @@ class LabeledWindows(Dataset):
         self.N = max(1, int(context_blocks))
         self.horizon_s = float(horizon_s)
 
+        # Pre-extract columnar metadata into fast NumPy/torch structures to eliminate per-sample DataFrame overhead
+        self._session_keys = self.df["session_key"].tolist()
+        self._stop_times = self.df["stop_time"].values.astype(np.float64)
+        self._cats = self.df["_cat"].values
+        self._raw_type_idxs = self.df["_type_idx"].values.astype(np.int64)
+
+        n_rows = len(self.df)
+        occ = np.zeros(n_rows, dtype=np.float32)
+        occ_valid = np.ones(n_rows, dtype=np.float32)
+        horizon_pos = np.zeros(n_rows, dtype=np.float32)
+        type_idx = np.full(n_rows, -1, dtype=np.int64)
+        is_ictal = np.zeros(n_rows, dtype=np.float32)
+        time_to_onset = np.full(n_rows, -1.0, dtype=np.float32)
+        session_idx = np.zeros(n_rows, dtype=np.int64)
+
+        for i in range(n_rows):
+            k = self._session_keys[i]
+            g_stop = self._stop_times[i]
+            cat = self._cats[i]
+            is_pre = (cat == LABEL_CATEGORY_PREICTAL)
+            is_ict = (cat == LABEL_CATEGORY_ICTAL)
+            if is_pre:
+                occ[i] = 1.0
+            if is_ict:
+                occ_valid[i] = 0.0
+                is_ictal[i] = 1.0
+            if is_ict or is_pre:
+                type_idx[i] = self._raw_type_idxs[i]
+            ons = self.onsets.get(k, [])
+            pos = bisect.bisect_left(ons, g_stop)
+            tto = (ons[pos] - g_stop) if pos < len(ons) else -1.0
+            time_to_onset[i] = float(tto)
+            if 0.0 <= tto <= self.horizon_s:
+                horizon_pos[i] = 1.0
+            session_idx[i] = self.session_idx[k]
+
+        self._occ = torch.from_numpy(occ)
+        self._occ_valid = torch.from_numpy(occ_valid)
+        self._horizon_pos = torch.from_numpy(horizon_pos)
+        self._type_idx = torch.from_numpy(type_idx)
+        self._is_ictal = torch.from_numpy(is_ictal)
+        self._time_to_onset = torch.from_numpy(time_to_onset)
+        self._session_idx = torch.from_numpy(session_idx)
+
     def __len__(self):
         return len(self.df)
 
@@ -215,41 +265,31 @@ class LabeledWindows(Dataset):
                 "type_hist": {self.type_classes[i]: int((d["_type_idx"] == i).sum()) for i in range(len(self.type_classes))}}
 
     def __getitem__(self, i):
-        r = self.df.iloc[i]
-        key = r["session_key"]
+        key = self._session_keys[i]
         arr = self.store.get(key)
         C, Ttot = arr.shape
-        e = int(round(float(r["stop_time"]) * self.fs))
+        e = int(round(float(self._stop_times[i]) * self.fs))
         e = min(max(e, self.T), Ttot)
-        s = e - self.T
-        blocks_tok, blocks_z = [], []
-        for j in range(self.N - 1, -1, -1):
-            b0, b1 = e - (j + 1) * self.T, e - j * self.T
-            if b1 <= 0:
-                x = np.zeros((C, self.T), dtype=np.float32)
-            else:
-                x = arr[:, max(0, b0): b1]
-                if x.shape[1] < self.T:
-                    x = np.pad(x, ((0, 0), (self.T - x.shape[1], 0)))
-            t, z, _ = self.tok.encode(x)
-            blocks_tok.append(t); blocks_z.append(z)
-        tokens = torch.from_numpy(np.stack(blocks_tok, axis=1))          # (C, N, T)
-        cat = r["_cat"]
-        is_pre, is_ict = cat == LABEL_CATEGORY_PREICTAL, cat == LABEL_CATEGORY_ICTAL
-        g_stop = float(r["stop_time"])
-        ons = self.onsets.get(key, [])
-        pos = bisect.bisect_left(ons, g_stop)
-        tto = (ons[pos] - g_stop) if pos < len(ons) else -1.0
-        horizon_pos = 1.0 if (0.0 <= tto <= self.horizon_s) else 0.0
+
+        L = self.N * self.T
+        if e - L >= 0:
+            x_total = arr[:, e - L: e].reshape(C, self.N, self.T)
+        else:
+            x_total = np.zeros((C, L), dtype=np.float32)
+            if e > 0:
+                x_total[:, L - e:] = arr[:, :e]
+            x_total = x_total.reshape(C, self.N, self.T)
+
+        t_all, z_all, _ = self.tok.encode(x_total)
         return {
-            "tokens": tokens,
-            "z_last": torch.from_numpy(blocks_z[-1]),
-            "occ": torch.tensor(1.0 if is_pre else 0.0),
-            "occ_valid": torch.tensor(0.0 if is_ict else 1.0),
-            "horizon_pos": torch.tensor(horizon_pos),
-            "type_idx": torch.tensor(int(r["_type_idx"]) if (is_ict or is_pre) else -1, dtype=torch.long),
-            "is_ictal": torch.tensor(1.0 if is_ict else 0.0),
-            "time_to_onset": torch.tensor(float(tto)),
+            "tokens": torch.from_numpy(t_all),
+            "z_last": torch.from_numpy(z_all[:, -1, :]),
+            "occ": self._occ[i],
+            "occ_valid": self._occ_valid[i],
+            "horizon_pos": self._horizon_pos[i],
+            "type_idx": self._type_idx[i],
+            "is_ictal": self._is_ictal[i],
+            "time_to_onset": self._time_to_onset[i],
             "row_idx": torch.tensor(i, dtype=torch.long),
-            "session_idx": torch.tensor(self.session_idx[key], dtype=torch.long),
+            "session_idx": self._session_idx[i],
         }

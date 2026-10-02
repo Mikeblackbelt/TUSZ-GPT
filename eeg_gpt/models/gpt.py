@@ -86,8 +86,7 @@ class EEGGPT(nn.Module):
         B, T = tokens.shape
         if T > self.block_size:
             raise ValueError(f"sequence {T} > block_size {self.block_size}")
-        pos = torch.arange(T, device=tokens.device)
-        x = self.tok_emb(tokens) + self.pos_emb(pos)[None] + self.ch_emb(channel)[:, None, :]
+        x = self.tok_emb(tokens) + self.pos_emb.weight[:T].unsqueeze(0) + self.ch_emb(channel).unsqueeze(1)
         x = self.drop(x)
         for b in self.blocks:
             x = b(x, causal=True)
@@ -144,16 +143,26 @@ class WindowEncoder(nn.Module):
         B, C, T = tokens.shape
         ch = torch.arange(C, device=tokens.device).repeat(B)                 # (B*C,)
         flat = tokens.reshape(B * C, T)
-        vs = []
-        for i in range(0, B * C, self.seq_chunk):
-            h = self.backbone.hidden(flat[i: i + self.seq_chunk], ch[i: i + self.seq_chunk])   # (b, T, d)
+        if B * C <= self.seq_chunk:
+            h = self.backbone.hidden(flat, ch)
             if self.pool == "last":
-                vs.append(h[:, -1])
+                v = h[:, -1]
             elif self.pool == "meanmax":
-                vs.append(0.5 * (h.mean(1) + h.amax(1)))
+                v = 0.5 * (h.mean(1) + h.amax(1))
             else:
-                vs.append(h.mean(1))                                           # eq. 17
-        v = torch.cat(vs, 0).view(B, C, -1) + self.ch_pos.weight[None, :C]
+                v = h.mean(1)
+        else:
+            vs = []
+            for i in range(0, B * C, self.seq_chunk):
+                h = self.backbone.hidden(flat[i: i + self.seq_chunk], ch[i: i + self.seq_chunk])   # (b, T, d)
+                if self.pool == "last":
+                    vs.append(h[:, -1])
+                elif self.pool == "meanmax":
+                    vs.append(0.5 * (h.mean(1) + h.amax(1)))
+                else:
+                    vs.append(h.mean(1))                                           # eq. 17
+            v = torch.cat(vs, 0)
+        v = v.view(B, C, -1) + self.ch_pos.weight[:C].unsqueeze(0)
         x = torch.cat([self.cls.expand(B, -1, -1), v], dim=1)               # (B, 1+C, d)
         for b in self.agg:
             x = b(x, causal=False)
@@ -170,7 +179,7 @@ class TemporalContext(nn.Module):
     def forward(self, v: torch.Tensor) -> torch.Tensor:
         """v (B, N, d) oldest->newest -> (B, d) at the newest block"""
         B, N, _ = v.shape
-        x = v + self.pos(torch.arange(N, device=v.device))[None]
+        x = v + self.pos.weight[:N].unsqueeze(0)
         for b in self.blocks:
             x = b(x, causal=True)
         return self.ln(x[:, -1])
