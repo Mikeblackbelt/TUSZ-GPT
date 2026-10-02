@@ -127,22 +127,39 @@ def test_pretrain_learns(ck):
     return m
 
 
+def test_max_gpu_usage_flag():
+    from eeg_gpt.training.device import parse_gpu_usage
+    assert parse_gpu_usage("0.0") == 0.0
+    assert parse_gpu_usage("0.5") == 0.5
+    assert parse_gpu_usage("1.0") == 1.0
+    for invalid in ("-0.01", "1.0001", "-1.0", "2.0", "not_a_float"):
+        try:
+            parse_gpu_usage(invalid)
+            assert False, f"Expected exception for invalid value: {invalid}"
+        except Exception:
+            pass
+    print("max-gpu-usage validation ok")
+
+
 def test_finetune(ck, csv, root):
     from eeg_gpt.training import finetune, pretrain
     pre = os.path.join(root, "pre")
     pretrain.main(["--checkpoint-dir", ck, "--out", pre, "--block-size", "256", "--d", "32", "--layers", "1", "--heads", "4", "--ffn", "64",
-                   "--steps", "40", "--batch-size", "8", "--val-sessions", "2", "--val-every", "40", "--val-batches", "2", "--num-workers", "0", "--n-levels", "64"])
+                   "--steps", "40", "--batch-size", "8", "--val-sessions", "2", "--val-every", "40", "--val-batches", "2", "--num-workers", "0",
+                   "--n-levels", "64", "--max-gpu-usage", "0.8"])
     assert os.path.exists(os.path.join(pre, "best.pt"))
     ft = os.path.join(root, "ft")
     finetune.main(["--master-csv", csv, "--checkpoint-dir", ck, "--pretrained", os.path.join(pre, "best.pt"), "--out", ft, "--epochs", "2",
                    "--steps-per-epoch", "8", "--batch-size", "4", "--accum", "1", "--context-blocks", "3", "--num-workers", "0", "--baseline",
-                   "--min-ictal-per-batch", "2", "--window-s", "1.0"])
+                   "--min-ictal-per-batch", "2", "--window-s", "1.0", "--max-gpu-usage", "0.75"])
     assert os.path.exists(os.path.join(ft, "best.pt")) and os.path.exists(os.path.join(ft, "history.json"))
     finetune.main(["--master-csv", csv, "--checkpoint-dir", ck, "--out", ft + "_eval", "--eval-only", "--load", os.path.join(ft, "best.pt"),
-                   "--pretrained", os.path.join(pre, "best.pt"), "--context-blocks", "3", "--num-workers", "0", "--batch-size", "4", "--window-s", "1.0"])
+                   "--pretrained", os.path.join(pre, "best.pt"), "--context-blocks", "3", "--num-workers", "0", "--batch-size", "4", "--window-s", "1.0",
+                   "--max-gpu-usage", "1.0"])
     # from-scratch control + horizon label
     finetune.main(["--master-csv", csv, "--checkpoint-dir", ck, "--out", ft + "_scratch", "--epochs", "1", "--steps-per-epoch", "4",
-                   "--batch-size", "4", "--accum", "1", "--num-workers", "0", "--label", "horizon", "--horizon-s", "130", "--window-s", "1.0"])
+                   "--batch-size", "4", "--accum", "1", "--num-workers", "0", "--label", "horizon", "--horizon-s", "130", "--window-s", "1.0",
+                   "--max-gpu-usage", "0.5"])
     print("finetune ok")
 
 
@@ -152,7 +169,7 @@ def test_adaptive(ck, csv, root):
     pid = patient_id(ds.sessions[0])
     ft = os.path.join(root, "adapt")
     finetune.main(["--master-csv", csv, "--checkpoint-dir", ck, "--out", ft, "--adapt-patient", pid, "--epochs", "1", "--steps-per-epoch", "3",
-                   "--batch-size", "4", "--accum", "1", "--num-workers", "0", "--window-s", "1.0"])
+                   "--batch-size", "4", "--accum", "1", "--num-workers", "0", "--window-s", "1.0", "--max-gpu-usage", "0.9"])
     print("patient-adaptive ok")
 
 
@@ -164,6 +181,8 @@ def main():
         it = ds[len(ds) // 2]
         print("labeled corpus:", ds.counts(), "| tokens", tuple(it["tokens"].shape), "| z_last", tuple(it["z_last"].shape))
         assert it["tokens"].shape == (C, 2, 1024)
+        test_training_loader_speed_settings()
+        test_max_gpu_usage_flag()
         test_tokenizer(); test_gpt_causal(); test_pretrain_learns(ck); test_finetune(ck, csv, root); test_adaptive(ck, csv, root)
         print("ALL TESTS PASSED")
     finally:

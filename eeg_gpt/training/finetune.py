@@ -30,6 +30,7 @@ from torch.utils.data import DataLoader, Sampler
 from eeg_gpt.data.datasets import LabeledWindows, patient_id, session_number
 from eeg_gpt.data.tokenizer import AmplitudeTokenizer
 from eeg_gpt.models.gpt import EEGGPT, SeizureModel, count_params
+from eeg_gpt.training.device import get_amp_scaler, get_autocast_kwargs, get_device, parse_gpu_usage, setup_device_and_hardware
 from eeg_gpt.training.metrics import (auroc, bandpower_baseline, bandpower_features, confusion, macro_f1,
                                       per_session_auroc, smoothed_auroc, threshold_sweep)
 
@@ -73,6 +74,8 @@ def build_parser():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--cache-capacity", type=int, default=8)
     p.add_argument("--amp", action="store_true")
+    p.add_argument("--device", default=None, help="Device to use (cuda, cuda:0, mps, cpu). Defaults to auto-detecting GPU.")
+    p.add_argument("--max-gpu-usage", type=parse_gpu_usage, default=None, help="Float between 0.0 and 1.0 inclusive specifying maximum fraction of GPU memory/usage.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-only", action="store_true")
     p.add_argument("--load", default=None, help="fine-tuned checkpoint for --eval-only")
@@ -138,10 +141,12 @@ def binary_targets(batch, label):
     return batch["horizon_pos"] if label == "horizon" else batch["occ"]
 
 
-def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False):
+def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False, pin_memory=None):
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
     kwargs = {
         "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
+        "pin_memory": pin_memory,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
@@ -153,10 +158,13 @@ def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, 
 
 def run_eval(model, loader, args, device, ds, do_baseline=False, train_loader=None):
     model.eval()
+    non_blocking = (device.type == "cuda")
+    autocast_kw = get_autocast_kwargs(device, args.amp)
     S, Y, V, SID, TIME, TP, TT, TI, Z = [], [], [], [], [], [], [], [], []
     with torch.no_grad():
         for b in loader:
-            out = model(b["tokens"].to(device, non_blocking=torch.cuda.is_available()))
+            with torch.autocast(**autocast_kw):
+                out = model(b["tokens"].to(device, non_blocking=non_blocking))
             S.append(torch.sigmoid(out["binary_logit"].float()).cpu()); Y.append(binary_targets(b, args.label)); V.append(b["occ_valid"])
             SID.append(b["session_idx"]); TIME.append(b["row_idx"].float()); TP.append(out["type_logits"].argmax(-1).cpu())
             TT.append(b["type_idx"]); TI.append(b["is_ictal"])
@@ -204,7 +212,9 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.out, "finetune.log"))])
     torch.manual_seed(args.seed); np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device(args.device)
+    setup_device_and_hardware(device, args.max_gpu_usage)
+    log.info(f"Using device: {device}")
     # --- backbone: from the pretraining checkpoint (architecture + tokenizer settings come with it) ---
     if args.pretrained:
         ck = torch.load(args.pretrained, map_location="cpu")
@@ -247,7 +257,9 @@ def main(argv=None):
     opt = torch.optim.AdamW([{"params": bb, "lr": args.lr}, {"params": rest, "lr": args.head_lr}], weight_decay=args.weight_decay)
     total = args.epochs * (args.steps_per_epoch or len(sampler)) // args.accum
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 100) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / max(1, total)))))
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    scaler = get_amp_scaler(device, args.amp)
+    autocast_kw = get_autocast_kwargs(device, args.amp)
+    non_blocking = (device.type == "cuda")
     json.dump(vars(args), open(os.path.join(args.out, "config.json"), "w"), indent=1)
     best, hist = -1.0, []
     for ep in range(1, args.epochs + 1):
@@ -255,12 +267,14 @@ def main(argv=None):
         for i, b in enumerate(tl):
             if args.steps_per_epoch and i >= args.steps_per_epoch:
                 break
-            tokens = b["tokens"].to(device, non_blocking=torch.cuda.is_available())
-            with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
+            tokens = b["tokens"].to(device, non_blocking=non_blocking)
+            with torch.autocast(**autocast_kw):
                 out = model(tokens)
-            y = binary_targets(b, args.label).to(device, non_blocking=torch.cuda.is_available()); v = b["occ_valid"].to(device, non_blocking=torch.cuda.is_available()) > 0.5
+            y = binary_targets(b, args.label).to(device, non_blocking=non_blocking)
+            v = (b["occ_valid"].to(device, non_blocking=non_blocking) > 0.5)
             lb = F.binary_cross_entropy_with_logits(out["binary_logit"].float()[v], y[v], pos_weight=pos_weight) if v.any() else out["binary_logit"].sum() * 0
-            ti = b["type_idx"].to(device); ii = b["is_ictal"].to(device) > 0.5
+            ti = b["type_idx"].to(device, non_blocking=non_blocking)
+            ii = (b["is_ictal"].to(device, non_blocking=non_blocking) > 0.5)
             wrow = torch.where(ii, 1.0, args.type_preictal_weight) * (ti >= 0).float()
             if (wrow > 0).any():
                 ce = F.cross_entropy(out["type_logits"].float(), ti.clamp_min(0), weight=tw, reduction="none")
@@ -272,7 +286,10 @@ def main(argv=None):
             if (i + 1) % args.accum == 0:
                 scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True); sched.step()
-            agg["loss"] += float(loss) * args.accum; agg["bin"] += float(lb); agg["type"] += float(lt); n += 1
+            agg["loss"] += float(loss.detach()) * args.accum
+            agg["bin"] += float(lb.detach())
+            agg["type"] += float(lt.detach())
+            n += 1
         log.info(f"epoch {ep} | " + " ".join(f"{k}={v / max(1, n):.4f}" for k, v in agg.items()) + f" | {time.time() - t0:.0f}s")
         res = run_eval(model, el, args, device, ev, args.baseline and ep == 1, tl_eval); log_eval(res, f"epoch {ep}", ev)
         hist.append({"epoch": ep, **{k: v for k, v in res.items() if k not in ("per_session", "type_cm_ictal")}})

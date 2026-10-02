@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from eeg_gpt.data.datasets import PretrainSessions, patient_id
 from eeg_gpt.data.tokenizer import AmplitudeTokenizer
 from eeg_gpt.models.gpt import EEGGPT, count_params, gpt_loss
+from eeg_gpt.training.device import get_amp_scaler, get_autocast_kwargs, get_device, parse_gpu_usage, setup_device_and_hardware
 
 log = logging.getLogger("pretrain")
 
@@ -58,6 +59,8 @@ def build_parser():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--cache-capacity", type=int, default=8)
     p.add_argument("--amp", action="store_true")
+    p.add_argument("--device", default=None, help="Device to use (cuda, cuda:0, mps, cpu). Defaults to auto-detecting GPU.")
+    p.add_argument("--max-gpu-usage", type=parse_gpu_usage, default=None, help="Float between 0.0 and 1.0 inclusive specifying maximum fraction of GPU memory/usage.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None)
     return p
@@ -81,10 +84,12 @@ def lr_at(step, args):
     return 1e-6 + 0.5 * (args.lr - 1e-6) * (1 + math.cos(math.pi * min(1.0, t)))
 
 
-def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False):
+def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, shuffle=False, drop_last=False, pin_memory=None):
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
     kwargs = {
         "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
+        "pin_memory": pin_memory,
         "persistent_workers": num_workers > 0,
     }
     if num_workers > 0:
@@ -97,12 +102,15 @@ def make_loader(dataset, *, batch_size=None, batch_sampler=None, num_workers=0, 
 @torch.no_grad()
 def evaluate(model, loader, tok, args, device, n_batches):
     model.eval(); agg = {}
+    non_blocking = (device.type == "cuda")
+    autocast_kw = get_autocast_kwargs(device, args.amp)
     for i, (tokens, z, ch) in enumerate(loader):
         if i >= n_batches:
             break
-        out = gpt_loss(model, tokens.to(device), z.to(device), ch.to(device), tok, args.lambda_mse)
+        with torch.autocast(**autocast_kw):
+            out = gpt_loss(model, tokens.to(device, non_blocking=non_blocking), z.to(device, non_blocking=non_blocking), ch.to(device, non_blocking=non_blocking), tok, args.lambda_mse)
         for k, v in out.items():
-            agg[k] = agg.get(k, 0.0) + float(v)
+            agg[k] = agg.get(k, 0.0) + float(v.detach())
     model.train()
     return {k: v / max(1, min(n_batches, len(loader))) for k, v in agg.items()}
 
@@ -113,7 +121,9 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.out, "pretrain.log"))])
     torch.manual_seed(args.seed); np.random.seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device(args.device)
+    setup_device_and_hardware(device, args.max_gpu_usage)
+    log.info(f"Using device: {device}")
     tok = AmplitudeTokenizer(args.n_levels, args.clip_k)
     from eeg_gpt.data.datasets import SessionStore
     all_sessions = SessionStore(args.checkpoint_dir, args.stage).list_sessions()
@@ -130,7 +140,9 @@ def main(argv=None):
     decay = [p for n, p in model.named_parameters() if p.ndim >= 2 and "emb" not in n]
     no_decay = [p for n, p in model.named_parameters() if not (p.ndim >= 2 and "emb" not in n)]
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay}, {"params": no_decay, "weight_decay": 0.0}], lr=args.lr, betas=(0.9, 0.95))
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")
+    scaler = get_amp_scaler(device, args.amp)
+    autocast_kw = get_autocast_kwargs(device, args.amp)
+    non_blocking = (device.type == "cuda")
     step = 0
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
@@ -145,11 +157,11 @@ def main(argv=None):
         agg = {}
         for _ in range(args.accum):
             tokens, z, ch = next(it)
-            with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
-                out = gpt_loss(model, tokens.to(device, non_blocking=torch.cuda.is_available()), z.to(device, non_blocking=torch.cuda.is_available()), ch.to(device, non_blocking=torch.cuda.is_available()), tok, args.lambda_mse)
+            with torch.autocast(**autocast_kw):
+                out = gpt_loss(model, tokens.to(device, non_blocking=non_blocking), z.to(device, non_blocking=non_blocking), ch.to(device, non_blocking=non_blocking), tok, args.lambda_mse)
             scaler.scale(out["loss"] / args.accum).backward()
             for k, v in out.items():
-                agg[k] = agg.get(k, 0.0) + float(v) / args.accum
+                agg[k] = agg.get(k, 0.0) + float(v.detach()) / args.accum
         scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt); scaler.update(); step += 1
         if step % 50 == 0:
