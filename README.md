@@ -65,8 +65,10 @@ python -m eeg_gpt.tests.test_pipeline          # ~3 min on CPU, must print ALL T
 
 # 1. Stage 1: pretrain on every session (one pass over ~70 h of 20-ch EEG = 20k steps at batch 64)
 python -m eeg_gpt.training.pretrain --checkpoint-dir ../checkpoints --out runs/pre_a \
-    --block-size 1024 --d 128 --layers 4 --heads 4 --steps 100000 --batch-size 64 --amp --num-workers 8
-#    variant worth one run: --pred-offsets 1,8,32   (multi-token prediction; runs/pre_b)
+    --block-size 1024 --steps 100000 --batch-size 64 --num-workers 8
+#    defaults: d 256 / 6 layers, RoPE + amplitude features + tied head, offsets 1,8,32, amp on for CUDA
+#    the first version's trunk: --d 128 --layers 4 --ffn 512 --no-rope --no-value-emb --no-tie-weights --pred-offsets 1
+#    compare runs on VAL ce@1 (plain next-token CE), not on `loss`; add --compile if torch.compile works on the box
 
 # 2. Stage 2: binary + type heads, single block, pretrained vs from-scratch (THE A/B)
 python -m eeg_gpt.training.finetune --master-csv ../master_full.csv --checkpoint-dir ../checkpoints \
@@ -81,13 +83,44 @@ python -m eeg_gpt.training.finetune ... --pretrained runs/pre_a/best.pt --out ru
 python -m eeg_gpt.training.finetune ... --label horizon --horizon-s 30 --out runs/ft_horizon
 python -m eeg_gpt.training.finetune ... --adapt-patient aaaaaaaa --adapt-train-frac 0.5 --out runs/adapt_aaaaaaaa
 
-# 5. evaluate any checkpoint
+# 5. Patient-specific training with 5-fold cross-validation
+# Mode A: fine-tune of Stage 1 pretrained trunk only
+python -m eeg_gpt.training.finetune --master-csv ../master_full.csv --checkpoint-dir ../checkpoints \
+    --patient aaaaaaaa --patient-base pretrained --pretrained runs/pre_a/best.pt --cv-folds 5 --out runs/pt_pre_aaaaaaaa --amp
+
+# Mode B: fine-tune of Stage 2 non-patient-specific (general) prediction model
+python -m eeg_gpt.training.finetune --master-csv ../master_full.csv --checkpoint-dir ../checkpoints \
+    --patient aaaaaaaa --patient-base general --general-checkpoint runs/ft_pre/best.pt --cv-folds 5 --out runs/pt_gen_aaaaaaaa --amp
+
+# 6. Candidate patient list sweep: profile & determine ideal candidates
+# Quick dataset profile: ranks candidates by 5-fold CV viability, event count, recording diversity, and suitability score
+python -m eeg_gpt.training.finetune --master-csv ../master_full.csv --checkpoint-dir ../checkpoints \
+    --sweep-patients --sweep-profile-only --out runs/patient_candidates
+
+# Full benchmark sweep: evaluate top ideal candidates across 5-fold CV, comparing pretrained vs general side-by-side
+python -m eeg_gpt.training.finetune --master-csv ../master_full.csv --checkpoint-dir ../checkpoints \
+    --sweep-patients --patient-base both --pretrained runs/pre_a/best.pt --general-checkpoint runs/ft_pre/best.pt \
+    --sweep-top-k 5 --cv-folds 5 --out runs/candidate_sweep --amp
+
+# 7. Stage 1 + Stage 2 in one command, 5-fold CV throughout (the TUSZ train/dev/eval splits are ignored)
+# ranks the patients (candidates.md: seizures, seizure types, amount of data), asks which ones to model
+# patient-specifically, pretrains 5 patient-disjoint folds on everyone else, then runs a 5-fold CV per chosen patient
+python -m eeg_gpt.training.pipeline --master-csv ../master_full.csv --checkpoint-dir ../checkpoints --out runs/pipe \
+    --pretrain-args "--steps 20000 --batch-size 64 --amp" --finetune-args "--epochs 10 --context-blocks 4 --amp"
+#   --only profile            just the ranking;  --patients id1,id2 | --top-k 3   choose without the prompt
+# same --out again with other patients: finished pretraining folds are reused, only the fine-tuning runs
+python -m eeg_gpt.training.pipeline ... --out runs/pipe --patients bbbbbbbb,cccccccc --run-name second_batch
+# results: runs/pipe/SUMMARY.md, pretrain/summary.md, finetune/<run>/summary.md
+
+# 8. evaluate any checkpoint
 python -m eeg_gpt.training.finetune ... --eval-only --load runs/ft_ctx8/best.pt --pretrained runs/pre_a/best.pt --context-blocks 8 --baseline
 ```
 
 Every fine-tuning log prints, per epoch: binary AUROC, threshold-sweep balanced accuracy,
 per-session AUROC (median, fraction of sessions > 0.6), AUROC after causal smoothing over
 5/15/60 blocks, the band-power baseline (epoch 1), and the ictal-row type confusion matrix.
+In 5-fold cross validation mode, logs report fold-by-fold results as well as aggregate
+cross-validated mean ± std metrics for AUROC, balanced accuracy, and sensitivity at fixed specificity.
 
 ## 4. What decides the next step
 

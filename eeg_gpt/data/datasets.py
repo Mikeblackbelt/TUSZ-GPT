@@ -24,10 +24,12 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
+from ..hardware import cache_budget_bytes, reader_threads
 from .label_utils import (
     LABEL_CATEGORY_BACKGROUND, LABEL_CATEGORY_EXCLUDED, LABEL_CATEGORY_ICTAL, LABEL_CATEGORY_PREICTAL,
     SEIZURE_TYPE_CLASSES, TYPE_GROUPINGS, classify_label, extract_seizure_type,
@@ -47,7 +49,29 @@ def session_number(session_key: str) -> int:
     return int(m.group(2)) if m else 0
 
 
+# per-process cache accounting: every DataLoader worker is its own process with its own share of RAM
+_PROC = {"pid": None, "budget": 0, "bytes": 0}
+
+
+def _proc_state() -> dict:
+    pid = os.getpid()
+    if _PROC["pid"] != pid:
+        wi = torch.utils.data.get_worker_info()
+        n = wi.num_workers if wi else 1
+        _PROC.update(pid=pid, budget=cache_budget_bytes(n), bytes=0)
+        try:
+            # pyarrow sizes its pool from the node's core count: bound it to our share of the usable cores
+            pa.set_cpu_count(reader_threads(n))
+        except Exception:
+            pass
+    return _PROC
+
+
 class SessionStore:
+    """`capacity` recordings are always kept; beyond that the cache keeps growing while the
+    process is inside its RAM budget (eeg_gpt/hardware.py), so a machine with memory to spare
+    stops re-reading parquet files altogether."""
+
     def __init__(self, checkpoint_dir: str, stage: str = "proc", capacity: int = 8, channels: Optional[list] = None):
         self.dir = checkpoint_dir
         self.stage = stage
@@ -55,6 +79,8 @@ class SessionStore:
         self.channels = channels
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
         self._n_samples_cache: dict = {}
+        self._disk_index: Optional[dict] = None      # file name -> [size, mtime_ns, rows], persisted next to the parquets
+        self._disk_dirty = False
 
     def path(self, session_key: str) -> str:
         return os.path.join(self.dir, f"{session_key}_{self.stage}.parquet")
@@ -63,16 +89,56 @@ class SessionStore:
         suf = f"_{self.stage}.parquet"
         return sorted(f[: -len(suf)] for f in os.listdir(self.dir) if f.endswith(suf))
 
+    def _index_path(self) -> str:
+        return os.path.join(self.dir, f".eeg_gpt_nsamples_{self.stage}.json")
+
     def n_samples(self, session_key: str) -> int:
         if session_key not in self._n_samples_cache:
-            self._n_samples_cache[session_key] = pq.ParquetFile(self.path(session_key), memory_map=True).metadata.num_rows
+            if self._disk_index is None:
+                try:
+                    with open(self._index_path()) as f:
+                        self._disk_index = json.load(f)
+                except (OSError, ValueError):
+                    self._disk_index = {}
+            path = self.path(session_key)
+            name = os.path.basename(path)
+            st = os.stat(path)
+            hit = self._disk_index.get(name)
+            if hit and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+                rows = int(hit[2])
+            else:
+                rows = pq.ParquetFile(path, memory_map=True).metadata.num_rows
+                self._disk_index[name] = [st.st_size, st.st_mtime_ns, rows]
+                self._disk_dirty = True
+            self._n_samples_cache[session_key] = rows
         return self._n_samples_cache[session_key]
+
+    def flush_index(self) -> None:
+        """Persist the row counts read so far, so the next run skips the parquet footers."""
+        if not self._disk_dirty:
+            return
+        self._disk_dirty = False
+        try:
+            merged = {}
+            try:
+                with open(self._index_path()) as f:
+                    merged = json.load(f)
+            except (OSError, ValueError):
+                pass
+            merged.update(self._disk_index)
+            tmp = f"{self._index_path()}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(merged, f)
+            os.replace(tmp, self._index_path())
+        except OSError:
+            pass                                     # read-only checkpoint dir: stay with the in-memory cache
 
     def get(self, session_key: str) -> np.ndarray:
         """(C, T) float32 array of the whole recording."""
         if session_key in self._cache:
             self._cache.move_to_end(session_key)
             return self._cache[session_key]
+        proc = _proc_state()
         tbl = pq.read_table(self.path(session_key), columns=self.channels, memory_map=True, use_threads=True)
         # int16 + per-channel scale (EDF-style storage written by the preprocessing
         # repo's checkpoint_io / tools/shrink_checkpoints.py) or plain float columns
@@ -91,8 +157,10 @@ class SessionStore:
         if self.channels is None:
             self.channels = list(tbl.column_names)
         self._cache[session_key] = arr
-        while len(self._cache) > self.capacity:
-            self._cache.popitem(last=False)
+        proc["bytes"] += arr.nbytes
+        while len(self._cache) > self.capacity and proc["bytes"] > proc["budget"]:
+            _, old = self._cache.popitem(last=False)
+            proc["bytes"] = max(0, proc["bytes"] - old.nbytes)
         return arr
 
 
@@ -102,12 +170,22 @@ class PretrainSessions(Dataset):
     __len__ is virtual (`samples_per_epoch`); sessions are drawn proportionally
     to their length so every hour of recording is seen equally often. Data
     loading with several workers is fine: each worker keeps its own cache.
+
+    Sampling is pooled so the parquet cache actually hits: sample i belongs to
+    stream `i % session_pool`, and a stream keeps its session for
+    `samples_per_session` draws before drawing a new one (streams are staggered,
+    so the pool turns over one session at a time). A batch therefore mixes
+    `session_pool` recordings while a full-recording read is amortized over
+    `samples_per_session` samples instead of paid on almost every sample.
     """
 
     def __init__(self, checkpoint_dir: str, block_size: int = 1024, samples_per_epoch: int = 100_000,
                  stage: str = "proc", cache_capacity: int = 8, tokenizer: Optional[AmplitudeTokenizer] = None,
-                 sessions: Optional[list] = None, stats: str = "block", seed: int = 0):
-        self.store = SessionStore(checkpoint_dir, stage, cache_capacity)
+                 sessions: Optional[list] = None, stats: str = "block", seed: int = 0,
+                 session_pool: int = 16, samples_per_session: int = 256):
+        self.pool = max(1, int(session_pool))
+        self.per_session = max(1, int(samples_per_session))
+        self.store = SessionStore(checkpoint_dir, stage, max(cache_capacity, self.pool))
         self.block = int(block_size)
         self.n = int(samples_per_epoch)
         self.tok = tokenizer or AmplitudeTokenizer()
@@ -116,12 +194,15 @@ class PretrainSessions(Dataset):
         if not self.sessions:
             raise ValueError(f"no *_{stage}.parquet sessions under {checkpoint_dir}")
         lengths = np.array([max(0, self.store.n_samples(s) - self.block - 1) for s in self.sessions], dtype=np.float64)
+        self.store.flush_index()
         keep = lengths > 0
         self.sessions = [s for s, k in zip(self.sessions, keep) if k]
         lengths = lengths[keep]
         self.p = lengths / lengths.sum()
+        self._cdf = np.cumsum(self.p)
         self.seed = seed
         self._session_stats: dict = {}
+        self._stream: dict = {}      # stream -> (turn, session index)
 
     def __len__(self):
         return self.n
@@ -133,10 +214,20 @@ class PretrainSessions(Dataset):
             self._session_stats[key] = (arr.mean(axis=1, keepdims=True), arr.std(axis=1, keepdims=True) + 1e-8)
         return self._session_stats[key]
 
+    def _session_for(self, i: int) -> str:
+        j = i % self.pool
+        turn = (i // self.pool + j * self.per_session // self.pool) // self.per_session
+        cur = self._stream.get(j)
+        if cur is None or cur[0] != turn:
+            u = np.random.default_rng((self.seed, j, turn)).random()
+            cur = (turn, min(int(np.searchsorted(self._cdf, u)), len(self.sessions) - 1))
+            self._stream[j] = cur
+        return self.sessions[cur[1]]
+
     def __getitem__(self, i):
         wi = torch.utils.data.get_worker_info()
         rng = np.random.default_rng(self.seed + i * 7919 + (wi.id if wi else 0))
-        s = self.sessions[rng.choice(len(self.sessions), p=self.p)]
+        s = self._session_for(i)
         arr = self.store.get(s)
         C, T = arr.shape
         c = int(rng.integers(0, C))
@@ -163,10 +254,11 @@ class LabeledWindows(Dataset):
     }
     """
 
-    def __init__(self, master_csv: str, checkpoint_dir: str, split: str, stage: str = "proc",
+    def __init__(self, master_csv: str, checkpoint_dir: str, split: Optional[str] = None, stage: str = "proc",
                  window_s: float = 4.0, fs: float = 256.0, context_blocks: int = 1, horizon_s: float = 30.0,
                  type_grouping: str = "focal_generalized", tokenizer: Optional[AmplitudeTokenizer] = None,
-                 cache_capacity: int = 8, keep_ictal: bool = True, sessions: Optional[list] = None):
+                 cache_capacity: int = 8, keep_ictal: bool = True, sessions: Optional[list] = None,
+                 patient: Optional[str] = None, row_indices: Optional[list[int] | np.ndarray] = None):
         df = pd.read_csv(master_csv)
         if "channel" in df.columns:
             df = df[df["channel"].astype(str).str.upper() == "TERM"]
@@ -174,6 +266,8 @@ class LabeledWindows(Dataset):
             df = df[df["is_valid"].astype(str).str.lower().isin(["true", "1", "1.0"]) | (df["is_valid"] == True)]  # noqa: E712
         if split and "split" in df.columns:
             df = df[df["split"].astype(str) == split]
+        if patient is not None:
+            df = df[df["session_key"].apply(patient_id) == patient]
         if sessions is not None:
             df = df[df["session_key"].isin(set(sessions))]
         df = df.copy()
@@ -193,6 +287,8 @@ class LabeledWindows(Dataset):
             self.onsets[k] = sorted(float(v) for v in g["start_time"].values)
         df = df[df["_cat"].isin([LABEL_CATEGORY_BACKGROUND, LABEL_CATEGORY_PREICTAL] + ([LABEL_CATEGORY_ICTAL] if keep_ictal else []))]
         df = df.sort_values(["session_key", "start_time"]).reset_index(drop=True)
+        if row_indices is not None:
+            df = df.iloc[row_indices].reset_index(drop=True)
         self.df = df
         self.sessions = sorted(df["session_key"].unique().tolist())
         self.session_idx = {s: i for i, s in enumerate(self.sessions)}

@@ -1,11 +1,12 @@
 """Evaluation utilities (ported from the previous repo's metrics/posthoc/baseline).
 
-auroc                 rank-based AUROC (ties averaged)
-threshold_sweep       best balanced accuracy over thresholds
-per_session_auroc     the distribution that a chance-level mean can hide
-smoothed_auroc        causal moving average ("firing power") inside each session
-bandpower_baseline    logistic regression on log relative band powers of the
-                      last block -- the floor every model has to beat
+auroc                     rank-based AUROC (ties averaged)
+threshold_sweep           best balanced accuracy over thresholds
+sensitivity_at_specificity sensitivity achieved while holding specificity >= target
+per_session_auroc         the distribution that a chance-level mean can hide
+smoothed_auroc            causal moving average ("firing power") inside each session
+bandpower_baseline        logistic regression on log relative band powers of the
+                          last block -- the floor every model has to beat
 """
 from __future__ import annotations
 
@@ -18,16 +19,8 @@ def auroc(scores, targets) -> float:
     n_pos, n_neg = int(y.sum()), int((1 - y).sum())
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-    order = np.argsort(s, kind="mergesort")
-    ranks = np.empty(len(s), dtype=np.float64)
-    ss = s[order]
-    i = 0
-    while i < len(ss):
-        j = i
-        while j + 1 < len(ss) and ss[j + 1] == ss[i]:
-            j += 1
-        ranks[order[i: j + 1]] = (i + j) / 2.0 + 1.0
-        i = j + 1
+    _, inv, cnt = np.unique(s, return_inverse=True, return_counts=True)
+    ranks = (np.cumsum(cnt) - (cnt - 1) / 2.0)[inv]          # 1-based rank, ties averaged
     return float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
@@ -43,6 +36,25 @@ def threshold_sweep(scores, targets, n: int = 99) -> dict:
         if ba > best["balanced_accuracy"]:
             best = {"threshold": float(thr), "balanced_accuracy": float(ba), "sensitivity": float(sens), "specificity": float(spec)}
     return best
+
+
+def sensitivity_at_specificity(scores, targets, target_specificity: float = 0.90) -> float:
+    """Return the sensitivity achieved by the highest threshold that keeps
+    specificity >= target_specificity.
+
+    This is clinically more meaningful than the balanced-accuracy optimum
+    because seizure prediction requires a bounded false-alarm rate.  If no
+    threshold satisfies the constraint, returns 0.0.
+    """
+    s = np.asarray(scores, dtype=np.float64); y = np.asarray(targets, dtype=np.float64)
+    n_pos, n_neg = int(y.sum()), int((1 - y).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    thr = np.unique(s)                                        # pred = s >= thr
+    tn = np.searchsorted(np.sort(s[y == 0]), thr, side="left")
+    tp = n_pos - np.searchsorted(np.sort(s[y == 1]), thr, side="left")
+    ok = tn / n_neg >= target_specificity
+    return float(tp[ok].max() / n_pos) if ok.any() else 0.0
 
 
 def per_session_auroc(session_idx, scores, targets, min_pos: int = 5, min_neg: int = 5) -> dict:
