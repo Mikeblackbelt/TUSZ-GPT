@@ -273,6 +273,12 @@ def test_patient_id_parsing():
         assert [p["patient_id"] for p in profs_trn] == ["patA"]
         profs_all = profile_all_patients(dummy_csv, window_s=4.0, cv_folds=2, min_preictal=1, min_sessions=1, min_background=1)
         assert set(p["patient_id"] for p in profs_all) == {"patA", "patB"}
+        # ids come from session_key: a numeric patient_id column must not drop the leading zeros
+        num_df = dummy_df.assign(patient_id=[254, 254, 255, 255],
+                                 session_key=["trn_00000254_s001", "trn_00000254_s002", "vld_00000255_s001", "tst_00000255_s002"])
+        num_df.to_csv(dummy_csv, index=False)
+        profs_num = profile_all_patients(dummy_csv, window_s=4.0, cv_folds=2, min_preictal=1, min_sessions=1, min_background=1)
+        assert set(p["patient_id"] for p in profs_num) == {"00000254", "00000255"}
     finally:
         os.remove(dummy_csv)
 
@@ -350,13 +356,17 @@ def test_cv_pipeline(ck, csv, root):
     assert not any(held[0] in f["val_patients"] for f in plan["folds"]), "held-out patient must not be in the pretraining corpus"
     run = json.load(open(os.path.join(out, "finetune", "first", "run.json")))
     assert len(run["patients"][0]["cv"]["folds"]) == 2
-    # fine-tune again on another patient: pretraining is reused, that patient starts from the fold that validated on it
+    # a patient that was pretrained on must not be fine-tuned patient-specifically from that pretraining
     other = plan["folds"][0]["val_patients"][0]
+    try:
+        pipeline.main(common + ["--patients", other, "--run-name", "second"])
+        raise AssertionError("fine-tuning a pretrained-on patient must be refused")
+    except SystemExit:
+        pass
+    # the held-out patient again: pretraining is reused, not redone
     stamp = os.path.getmtime(os.path.join(out, "pretrain", "fold_1", "best.pt"))
-    pipeline.main(common + ["--patients", other, "--run-name", "second"])
+    pipeline.main(common + ["--patients", held[0], "--run-name", "second"])
     assert os.path.getmtime(os.path.join(out, "pretrain", "fold_1", "best.pt")) == stamp
-    run2 = json.load(open(os.path.join(out, "finetune", "second", "run.json")))
-    assert "pretraining fold 1" in run2["patients"][0]["init"]
     text = open(os.path.join(out, "SUMMARY.md"), encoding="utf-8").read()
     assert "Run first" in text and "Run second" in text and "Pretraining cross-validation" in text
     print("pretrain -> finetune CV pipeline ok")

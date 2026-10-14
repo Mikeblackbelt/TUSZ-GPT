@@ -291,12 +291,8 @@ class LabeledWindows(Dataset):
         if split and "split" in df.columns:
             df = df[df["split"].astype(str) == split]
         if patient is not None:
-            if "patient_id" in df.columns:
-                df = df[df["patient_id"].astype(str) == str(patient)]
-            elif "patient" in df.columns:
-                df = df[df["patient"].astype(str) == str(patient)]
-            else:
-                df = df[df["session_key"].apply(patient_id) == str(patient)]
+            # from session_key, like everywhere else (pretraining folds use the parquet file names)
+            df = df[df["session_key"].apply(patient_id) == str(patient)]
         if sessions is not None:
             df = df[df["session_key"].isin(set(sessions))]
         df = df.copy()

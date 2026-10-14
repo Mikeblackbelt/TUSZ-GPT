@@ -146,13 +146,9 @@ def profile_all_patients(
     df = df.copy()
     df["_cat"] = df["label"].apply(classify_label)
 
-    # Use explicit patient_id / patient column if present, else extract from session_key
-    if "patient_id" in df.columns:
-        df["_patient_id"] = df["patient_id"].astype(str)
-    elif "patient" in df.columns:
-        df["_patient_id"] = df["patient"].astype(str)
-    else:
-        df["_patient_id"] = df["session_key"].apply(patient_id)
+    # Always from session_key: the pipeline holds patients out of pretraining by patient_id(<parquet name>), so a
+    # CSV patient column (read as int it loses leading zeros: 00000254 -> 254) would silently not match it
+    df["_patient_id"] = df["session_key"].apply(patient_id)
 
     # Use explicit session_id / session column if present, else use session_key
     if "session_id" in df.columns:
@@ -166,6 +162,8 @@ def profile_all_patients(
     for pid, pdf in df.groupby("_patient_id"):
         pid_str = str(pid).strip()
         if not pid_str or pid_str.lower() in _SPLIT_PREFIXES or pid_str.lower() in {"unknown", "none", "proc", "raw", "nan"}:
+            log.warning(f"skipping {len(pdf)} rows whose session_key gives no patient id {pid_str!r} "
+                        f"(e.g. {pdf['session_key'].iloc[0]!r})")
             continue
         sess_list = sorted(pdf["_session_id"].unique().tolist(), key=session_number)
         n_sessions = len(sess_list)

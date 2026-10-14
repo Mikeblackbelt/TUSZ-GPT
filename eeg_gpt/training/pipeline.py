@@ -12,10 +12,9 @@
               checkpoints (--pretrain-select paired: fine-tune fold k starts from pretraining fold k).
 4. Summary  : SUMMARY.md (everything), pretrain/summary.md and finetune/<run>/summary.md.
 
-Running it again on the same --out reuses whatever is finished: pretraining folds are skipped, so
-`--patients <others>` only fine-tunes the new patients. A patient that was not held out was part of the
-pretraining corpus; it is fine-tuned from the one pretraining fold that had it in its validation part (never
-trained on it), and the summary says so.
+Running it again on the same --out reuses whatever is finished: pretraining folds are skipped. Pretraining only
+ever sees patients that are not fine-tuned patient-specifically, so a later run on the same --out may only name
+patients that were held out when that pretraining was planned; anyone else needs a new --out.
 """
 from __future__ import annotations
 
@@ -131,7 +130,8 @@ def choose_patients(args, profiles):
     for tok in (t.strip() for t in raw.split(",")):
         if not tok:
             continue
-        pid = ids[int(tok) - 1] if tok.isdigit() and 1 <= int(tok) <= len(ids) else tok
+        # an exact id wins over a rank: numeric TUSZ ids (00000254) are digits too
+        pid = tok if tok in ids else ids[int(tok) - 1] if tok.isdigit() and 1 <= int(tok) <= len(ids) else tok
         if pid not in ids:
             raise SystemExit(f"unknown patient '{tok}' (not in the master CSV)")
         if pid not in chosen:
@@ -145,7 +145,12 @@ def choose_patients(args, profiles):
 
 def plan_pretrain_folds(sessions, held_out, n_folds, seed):
     """Patient-disjoint folds over every patient that is not held out for patient-specific training."""
-    pats = sorted({patient_id(s) for s in sessions} - set(held_out))
+    all_pats = {patient_id(s) for s in sessions}
+    missing = sorted(set(held_out) - all_pats)
+    if missing:   # holding out an id no recording has would leak that patient into pretraining unnoticed
+        raise SystemExit(f"held-out patients {missing} match no recording in the checkpoint dir; "
+                         f"ids there look like {sorted(all_pats)[:5]}")
+    pats = sorted(all_pats - set(held_out))
     if len(pats) < n_folds:
         raise SystemExit(f"{len(pats)} patients left for pretraining, need >= {n_folds} for {n_folds}-fold CV")
     rng = np.random.default_rng(seed); rng.shuffle(pats)
@@ -229,12 +234,7 @@ def checkpoints_for(pid, plan, select):
     if not done:
         raise SystemExit("no finished pretraining fold; run the pretraining stage first")
     if pid not in plan["held_out"]:
-        own = [f for f in done if pid in f["val_patients"]]
-        if own:
-            return [own[0]["result"]["checkpoint"]], (f"pretraining fold {own[0]['fold']} (patient was in its validation part: never trained on, "
-                                                      f"but it took part in checkpoint selection)")
-        if any(pid in f["val_patients"] for f in plan["folds"]):
-            raise SystemExit(f"patient {pid} is in the pretraining corpus and the fold that validates on it is not finished")
+        raise SystemExit(f"patient {pid} is in the pretraining corpus of this --out; use a new --out to hold it out")
     if select == "best":
         best = min(done, key=lambda f: f["result"]["val"].get("ce@1", float("inf")))
         return [best["result"]["checkpoint"]], f"pretraining fold {best['fold']} (best held-out ce@1); patient never seen in pretraining"
@@ -340,15 +340,15 @@ def main(argv=None):
         return
     patients = choose_patients(args, profiles)
     log.info(f"patient-specific patients: {patients}")
-    if args.only == "finetune":
-        plan = load_pretrain_state(args.out)
-        if plan is None:
-            raise SystemExit(f"--only finetune: no pretraining found under {args.out}")
-    else:
+    plan = load_pretrain_state(args.out)
+    if args.only == "finetune" and plan is None:
+        raise SystemExit(f"--only finetune: no pretraining found under {args.out}")
+    seen = [p for p in patients if plan is not None and p not in plan["held_out"]]
+    if seen:   # their recordings are in the pretraining corpus: fine-tuning them would not be patient-disjoint
+        raise SystemExit(f"{seen} were not held out when the pretraining in {args.out} was planned (held out: {plan['held_out']}); "
+                         f"use a new --out to pretrain without them")
+    if args.only != "finetune":
         plan = run_pretrain_cv(args, patients)
-    seen = [p for p in patients if p not in plan["held_out"]]
-    if seen:
-        log.warning(f"{seen} were not held out when this pretraining was planned; each uses the pretraining fold that validated on it")
     if args.only != "pretrain":
         run_finetune_cv(args, patients, plan, profiles)
     log.info(f"summary written to {write_summary(args.out)}")
