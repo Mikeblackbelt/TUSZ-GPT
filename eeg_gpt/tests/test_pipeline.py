@@ -372,6 +372,25 @@ def test_cv_pipeline(ck, csv, root):
     print("pretrain -> finetune CV pipeline ok")
 
 
+def test_stats(root):
+    from eeg_gpt import stats
+    rng = np.random.default_rng(0)
+    for run, shift in (("A", 0.25), ("B", 0.1)):
+        for pid in ("p1", "p2", "p3", "p4", "p5"):
+            d = os.path.join(root, "stats", run, f"patient_{pid}"); os.makedirs(d, exist_ok=True)
+            folds = [{"fold": k, "auroc": float(0.5 + shift + rng.normal(0, 0.03)), "sweep_ba": 0.6,
+                      "sens_at_spec": {"spec80": 0.5, "spec90": 0.3}, "type_macro_f1": float("nan")} for k in range(1, 6)]
+            json.dump({"patient_id": pid, "folds": folds}, open(os.path.join(d, "cv_summary.json"), "w"))
+    res = stats.main(["--run", os.path.join(root, "stats", "A"), "--compare", os.path.join(root, "stats", "B"),
+                      "--out", os.path.join(root, "stats", "report.md")])
+    assert res["vs_chance"]["cohort"]["n"] == 5 and res["vs_chance"]["cohort"]["mean"] > 0.7
+    assert res["vs_chance"]["cohort"]["p_t"] < 0.001 and res["vs_chance"]["cohort"]["d"] > 0.8
+    assert res["paired"]["pairs"] == 25 and res["paired"]["folds"]["mean"] > 0.1
+    assert stats.holm([0.01, 0.04, float("nan")])[:2] == [0.02, 0.04]
+    assert os.path.exists(os.path.join(root, "stats", "report.json"))
+    print("stats ok")
+
+
 def main():
     root = tempfile.mkdtemp(prefix="eeggpt_")
     try:
@@ -386,6 +405,7 @@ def main():
         test_tokenizer(); test_gpt_causal(); test_metrics(); test_pooled_sampling(ck); test_pretrain_learns(ck); test_finetune(ck, csv, root); test_adaptive(ck, csv, root)
         test_patient_sweep_and_cv(ck, csv, root)
         test_cv_pipeline(ck, csv, root)
+        test_stats(root)
         print("ALL TESTS PASSED")
     finally:
         shutil.rmtree(root, ignore_errors=True)
