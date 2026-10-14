@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from eeg_gpt.data.datasets import LabeledWindows, _SPLIT_PREFIXES, patient_id, session_number
+from eeg_gpt.data.datasets import LabeledWindows, _SPLIT_PREFIXES, load_master, patient_id, session_number
 from eeg_gpt.data.label_utils import (
     LABEL_CATEGORY_BACKGROUND, LABEL_CATEGORY_EXCLUDED, LABEL_CATEGORY_ICTAL, LABEL_CATEGORY_PREICTAL,
     classify_label, extract_seizure_type,
@@ -135,20 +135,14 @@ def profile_all_patients(
     split: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Analyzes all patients in the master CSV and ranks ideal candidates."""
-    df = pd.read_csv(master_csv)
-    if "channel" in df.columns:
-        df = df[df["channel"].astype(str).str.upper() == "TERM"]
-    if "is_valid" in df.columns:
-        df = df[df["is_valid"].astype(str).str.lower().isin(["true", "1", "1.0"]) | (df["is_valid"] == True)]  # noqa: E712
+    t0 = time.time()
+    df = load_master(master_csv)
     if split is not None and "split" in df.columns:
         df = df[df["split"].astype(str) == split]
 
-    df = df.copy()
-    df["_cat"] = df["label"].apply(classify_label)
-
     # Always from session_key: the pipeline holds patients out of pretraining by patient_id(<parquet name>), so a
     # CSV patient column (read as int it loses leading zeros: 00000254 -> 254) would silently not match it
-    df["_patient_id"] = df["session_key"].apply(patient_id)
+    df = df.assign(_patient_id=df["_patient"])
 
     # Use explicit session_id / session column if present, else use session_key
     if "session_id" in df.columns:
@@ -238,6 +232,7 @@ def profile_all_patients(
         })
 
     profiles.sort(key=lambda p: (p["is_ideal_candidate"], p["suitability_score"], p["n_preictal"]), reverse=True)
+    log.info(f"profiled {len(profiles)} patients ({sum(p['is_ideal_candidate'] for p in profiles)} ideal) in {time.time() - t0:.1f}s")
     return profiles
 
 
@@ -461,11 +456,19 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
     best_auroc = -1.0
     best_res: dict[str, Any] = {}
 
+    n_batches = args.steps_per_epoch or len(sampler)
+    log.info(f"fold training: {len(tr_ds)} train rows ({int(ypos)} preictal / {int(yneg)} background), {len(ev_ds)} eval rows | "
+             f"{args.epochs} epochs x {n_batches} batches of {args.batch_size} (accum {args.accum}, {total_steps} optimizer steps) | "
+             f"pos_weight {pos_weight.item():.1f}")
+    log_every = max(1, n_batches // 5)
     for ep in range(1, args.epochs + 1):
         model.train()
+        t_ep = time.time(); t_wait = 0.0; t_last = t_ep
+        sum_lb = sum_lt = 0.0; n_seen = 0
         for i, b in enumerate(tl):
             if args.steps_per_epoch and i >= args.steps_per_epoch:
                 break
+            t_wait += time.time() - t_last
             tokens = b["tokens"].to(device, non_blocking=non_blocking)
             with torch.autocast(**autocast_kw):
                 out = model(tokens)
@@ -495,15 +498,30 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
                 sched.step()
+            sum_lb += float(lb.detach()); sum_lt += float(lt.detach()); n_seen = i + 1
+            if n_seen % log_every == 0:
+                el_s = time.time() - t_ep
+                log.info(f"  ep {ep} batch {n_seen}/{n_batches} | binary {sum_lb / n_seen:.4f} | type {sum_lt / n_seen:.4f} | "
+                         f"{n_seen * args.batch_size / el_s:.0f} windows/s | waiting on data {100 * t_wait / el_s:.0f}%"
+                         + (f" | gpu peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f}G" if device.type == "cuda" else ""))
+            t_last = time.time()
 
+        t_train = time.time() - t_ep
         # Evaluate fold
+        t_ev = time.time()
         res = run_eval(model, el, args, device, ev_ds, args.baseline and ep == 1, tl_eval)
         cur_auroc = res.get("auroc", 0.0)
-        if not math.isnan(cur_auroc) and cur_auroc > best_auroc:
+        improved = not math.isnan(cur_auroc) and cur_auroc > best_auroc
+        if improved:
             best_auroc = cur_auroc
             best_res = copy.deepcopy(res)
             best_res["best_epoch"] = ep
             torch.save({"model": model.state_dict(), "epoch": ep, "config": vars(args)}, os.path.join(fold_out_dir, "best.pt"))
+        sw = res.get("sweep", {})
+        log.info(f"epoch {ep}/{args.epochs} | train binary {sum_lb / max(1, n_seen):.4f} type {sum_lt / max(1, n_seen):.4f} | "
+                 f"eval AUROC {cur_auroc:.4f} BA {sw.get('balanced_accuracy', float('nan')):.3f} | "
+                 f"best {best_auroc:.4f}{' *' if improved else ''} | train {t_train:.0f}s eval {time.time() - t_ev:.0f}s | "
+                 f"lr {sched.get_last_lr()[-1]:.2e}")
 
     if not best_res:
         best_res = run_eval(model, el, args, device, ev_ds, False)
@@ -587,8 +605,10 @@ def run_patient_cv(
 
     for fold_k, (tr_idx, ev_idx) in enumerate(splits, start=1):
         log.info(f"--- Patient {target_patient} | Fold {fold_k}/{args.cv_folds} (train={len(tr_idx)}, eval={len(ev_idx)}) ---")
+        t_fold = time.time()
         tr_ds = LabeledWindows(args.master_csv, args.checkpoint_dir, split=None, patient=target_patient, row_indices=tr_idx, **kw)
         ev_ds = LabeledWindows(args.master_csv, args.checkpoint_dir, split=None, patient=target_patient, row_indices=ev_idx, **kw)
+        log.info(f"fold datasets built in {time.time() - t_fold:.1f}s | eval sessions: {ev_ds.sessions}")
 
         # Build fresh model instance for this fold according to base mode
         if base_mode == "general":
@@ -606,7 +626,10 @@ def run_patient_cv(
             model, _ = build_pretrained_seizure_model(fold_pretrained, device, n_channels, n_types, args)
 
         fold_dir = os.path.join(out_dir, f"fold_{fold_k}")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         res = run_one_fold_training(fold_k, tr_ds, ev_ds, model, args, device, fold_dir)
+        log.info(f"fold {fold_k} finished in {(time.time() - t_fold) / 60:.1f} min")
 
         auroc_val = res.get("auroc", float("nan"))
         sw = res.get("sweep", {})

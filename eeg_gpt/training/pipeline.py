@@ -354,5 +354,15 @@ def main(argv=None):
     log.info(f"summary written to {write_summary(args.out)}")
 
 
+def _main_logged(argv=None):
+    try:
+        main(argv)
+    except SystemExit:
+        raise
+    except BaseException:   # tracebacks go to stderr only; keep them in pipeline.log too
+        log.exception("pipeline crashed")
+        raise
+
+
 if __name__ == "__main__":
-    main()
+    _main_logged()

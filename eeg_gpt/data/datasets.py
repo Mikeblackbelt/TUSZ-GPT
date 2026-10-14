@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import bisect
 import json
+import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from typing import Optional
 
@@ -35,6 +37,8 @@ from .label_utils import (
     SEIZURE_TYPE_CLASSES, TYPE_GROUPINGS, classify_label, extract_seizure_type,
 )
 from .tokenizer import AmplitudeTokenizer
+
+log = logging.getLogger("eeg_gpt.data")
 
 _SPLIT_PREFIXES = {
     "trn", "train", "training",
@@ -72,6 +76,43 @@ def session_number(session_key: str) -> int:
     m2 = re.search(r"_s(\d+)", str(session_key), re.I)
     return int(m2.group(1)) if m2 else 0
 
+
+
+_MASTER_CACHE: dict = {}
+
+
+def _map_unique(col: pd.Series, fn) -> pd.Series:
+    """fn over the distinct values only: a few thousand session keys / labels instead of millions of rows."""
+    return col.map({v: fn(v) for v in col.unique()})
+
+
+def load_master(master_csv: str) -> pd.DataFrame:
+    """The labeled rows of the master CSV (TERM channel, is_valid) with `_patient`, `_cat` and `_type_raw` added.
+
+    Read and parsed once per process (keyed on path, size and mtime): the patient CV builds 11 datasets per
+    patient, and each used to re-read and re-parse the whole CSV. Callers must not modify the returned frame.
+    """
+    st = os.stat(master_csv)
+    key = (os.path.abspath(master_csv), st.st_size, st.st_mtime_ns)
+    df = _MASTER_CACHE.get(key)
+    if df is not None:
+        return df
+    t0 = time.time()
+    df = pd.read_csv(master_csv, dtype={"session_key": str, "label": str}, low_memory=False)
+    n_all = len(df)
+    if "channel" in df.columns:
+        df = df[df["channel"].astype(str).str.upper() == "TERM"]
+    if "is_valid" in df.columns:
+        df = df[df["is_valid"].astype(str).str.lower().isin(["true", "1", "1.0"]) | (df["is_valid"] == True)]  # noqa: E712
+    df = df.reset_index(drop=True)
+    df["_patient"] = _map_unique(df["session_key"], patient_id)
+    df["_cat"] = _map_unique(df["label"], classify_label)
+    df["_type_raw"] = _map_unique(df["label"], extract_seizure_type)
+    _MASTER_CACHE.clear()
+    _MASTER_CACHE[key] = df
+    log.info(f"master CSV {master_csv}: {n_all} rows read, {len(df)} labeled TERM rows kept, "
+             f"{df['_patient'].nunique()} patients, {df['session_key'].nunique()} sessions ({time.time() - t0:.1f}s, cached for this process)")
+    return df
 
 # per-process cache accounting: every DataLoader worker is its own process with its own share of RAM
 _PROC = {"pid": None, "budget": 0, "bytes": 0}
@@ -283,21 +324,16 @@ class LabeledWindows(Dataset):
                  type_grouping: str = "focal_generalized", tokenizer: Optional[AmplitudeTokenizer] = None,
                  cache_capacity: int = 8, keep_ictal: bool = True, sessions: Optional[list] = None,
                  patient: Optional[str] = None, row_indices: Optional[list[int] | np.ndarray] = None):
-        df = pd.read_csv(master_csv)
-        if "channel" in df.columns:
-            df = df[df["channel"].astype(str).str.upper() == "TERM"]
-        if "is_valid" in df.columns:
-            df = df[df["is_valid"].astype(str).str.lower().isin(["true", "1", "1.0"]) | (df["is_valid"] == True)]  # noqa: E712
+        t0 = time.time()
+        df = load_master(master_csv)
         if split and "split" in df.columns:
             df = df[df["split"].astype(str) == split]
         if patient is not None:
             # from session_key, like everywhere else (pretraining folds use the parquet file names)
-            df = df[df["session_key"].apply(patient_id) == str(patient)]
+            df = df[df["_patient"] == str(patient)]
         if sessions is not None:
             df = df[df["session_key"].isin(set(sessions))]
         df = df.copy()
-        df["_cat"] = df["label"].apply(classify_label)
-        df["_type_raw"] = df["label"].apply(extract_seizure_type)
         groups = TYPE_GROUPINGS.get(type_grouping)
         if groups is None:
             self.type_classes = SEIZURE_TYPE_CLASSES
@@ -367,6 +403,8 @@ class LabeledWindows(Dataset):
         self._is_ictal = torch.from_numpy(is_ictal)
         self._time_to_onset = torch.from_numpy(time_to_onset)
         self._session_idx = torch.from_numpy(session_idx)
+        log.debug(f"LabeledWindows: {n_rows} rows, {len(self.sessions)} sessions"
+                  f"{f' (patient {patient})' if patient is not None else ''}{f' (split {split})' if split else ''} in {time.time() - t0:.2f}s")
 
     def __len__(self):
         return len(self.df)
