@@ -74,14 +74,14 @@ def build_parser():
     p.add_argument("--cv-folds", type=int, default=5)
     p.add_argument("--min-preictal", type=int, default=5)
     p.add_argument("--min-sessions", type=int, default=2)
-    p.add_argument("--min-background", type=int, default=20)
+    p.add_argument("--split", default=None, help="filter master CSV to a specific split (e.g. 'train' or 'trn')")
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     patients = patient_map(args.master_csv, window_s=args.window_s, cv_folds=args.cv_folds, min_preictal=args.min_preictal,
-                           min_sessions=args.min_sessions, min_background=args.min_background)
+                           min_sessions=args.min_sessions, min_background=args.min_background, split=args.split)
     if args.patient:
         if args.patient not in patients:
             raise SystemExit(f"patient {args.patient!r} not in {args.master_csv} ({len(patients)} patients)")

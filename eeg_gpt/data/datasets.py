@@ -36,17 +36,41 @@ from .label_utils import (
 )
 from .tokenizer import AmplitudeTokenizer
 
-_PAT_RE = re.compile(r"^(?:trn|dev|eval|train|test)?_?([a-z]{8})_s(\d+)_", re.I)
+_SPLIT_PREFIXES = {
+    "trn", "train", "training",
+    "dev", "devel", "development",
+    "val", "vld", "valid", "validation",
+    "eval", "evaluation",
+    "tst", "test", "testing",
+}
+
+_PAT_RE = re.compile(
+    r"^(?:(?:trn|train|training|dev|devel|development|val|vld|valid|validation|eval|evaluation|tst|test|testing)_)?([a-z0-9]+)_s(\d+)",
+    re.I,
+)
 
 
 def patient_id(session_key: str) -> str:
-    m = _PAT_RE.match(str(session_key))
-    return m.group(1) if m else str(session_key).split("_")[0]
+    s = str(session_key).strip()
+    m = _PAT_RE.match(s)
+    if m:
+        pid = m.group(1)
+        if pid.lower() not in _SPLIT_PREFIXES:
+            return pid
+    # Fallback: scan underscore-separated tokens for the first token that is not a split prefix or stage suffix
+    parts = s.split("_")
+    for p in parts:
+        if p.lower() not in _SPLIT_PREFIXES and p.lower() not in {"proc", "raw", "parquet"} and p:
+            return p
+    return "unknown"
 
 
 def session_number(session_key: str) -> int:
     m = _PAT_RE.match(str(session_key))
-    return int(m.group(2)) if m else 0
+    if m:
+        return int(m.group(2))
+    m2 = re.search(r"_s(\d+)", str(session_key), re.I)
+    return int(m2.group(1)) if m2 else 0
 
 
 # per-process cache accounting: every DataLoader worker is its own process with its own share of RAM
@@ -267,7 +291,12 @@ class LabeledWindows(Dataset):
         if split and "split" in df.columns:
             df = df[df["split"].astype(str) == split]
         if patient is not None:
-            df = df[df["session_key"].apply(patient_id) == patient]
+            if "patient_id" in df.columns:
+                df = df[df["patient_id"].astype(str) == str(patient)]
+            elif "patient" in df.columns:
+                df = df[df["patient"].astype(str) == str(patient)]
+            else:
+                df = df[df["session_key"].apply(patient_id) == str(patient)]
         if sessions is not None:
             df = df[df["session_key"].isin(set(sessions))]
         df = df.copy()

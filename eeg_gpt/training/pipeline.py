@@ -60,6 +60,7 @@ def build_parser():
     p.add_argument("--finetune-args", default="", help="extra arguments for eeg_gpt.training.finetune, as one quoted string")
     p.add_argument("--device", default=None)
     p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--split", default=None, help="filter master CSV to a specific split (e.g. 'train' or 'trn')")
     p.add_argument("--seed", type=int, default=0)
     return p
 
@@ -331,7 +332,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.out, "pipeline.log"))])
     profiles = profile_all_patients(args.master_csv, window_s=args.window_s, cv_folds=args.cv_folds, min_preictal=args.min_preictal,
-                                    min_sessions=args.min_sessions, min_background=args.min_background)
+                                    min_sessions=args.min_sessions, min_background=args.min_background, split=args.split)
     _write_json(os.path.join(args.out, "candidates.json"), profiles)
     _write_text(os.path.join(args.out, "candidates.md"), candidates_markdown(profiles))
     print("\n" + format_candidates_table(profiles) + "\n")

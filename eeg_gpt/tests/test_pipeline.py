@@ -218,6 +218,67 @@ def test_adaptive(ck, csv, root):
     print("patient-adaptive ok")
 
 
+def test_patient_id_parsing():
+    from eeg_gpt.data.datasets import _SPLIT_PREFIXES, patient_id, session_number
+    # Split prefixes with letter patient IDs
+    assert patient_id("trn_aaaaaaaa_s001_2010_ar1") == "aaaaaaaa"
+    assert session_number("trn_aaaaaaaa_s001_2010_ar1") == 1
+    assert patient_id("vld_aaaaaaaa_s001_2010_ar1") == "aaaaaaaa"
+    assert session_number("vld_aaaaaaaa_s001_2010_ar1") == 1
+    assert patient_id("tst_aaaaaaaa_s002_2010_ar1") == "aaaaaaaa"
+    assert session_number("tst_aaaaaaaa_s002_2010_ar1") == 2
+    assert patient_id("dev_aaaaaaaa_s003_2010_ar1") == "aaaaaaaa"
+    assert session_number("dev_aaaaaaaa_s003_2010_ar1") == 3
+    assert patient_id("eval_aaaaaaaa_s004_2010_ar1") == "aaaaaaaa"
+    assert session_number("eval_aaaaaaaa_s004_2010_ar1") == 4
+
+    # Split prefixes with numeric patient IDs (standard TUSZ)
+    assert patient_id("vld_00000254_s005_2010_ar1") == "00000254"
+    assert session_number("vld_00000254_s005_2010_ar1") == 5
+    assert patient_id("tst_00000254_s006_2010_ar1") == "00000254"
+    assert session_number("tst_00000254_s006_2010_ar1") == 6
+    assert patient_id("trn_00000254_s001_2010_ar1") == "00000254"
+    assert session_number("trn_00000254_s001_2010_ar1") == 1
+
+    # Unprefixed session keys
+    assert patient_id("00000254_s001_2010_ar1") == "00000254"
+    assert session_number("00000254_s001_2010_ar1") == 1
+    assert patient_id("aaaaaaaa_s001_2010_ar1") == "aaaaaaaa"
+    assert session_number("aaaaaaaa_s001_2010_ar1") == 1
+
+    # Never return split names as patient IDs
+    for split in _SPLIT_PREFIXES:
+        assert patient_id(split) != split
+        assert patient_id(f"{split}_proc") != split
+
+    # Test explicit patient_id and session_id column usage & split filtering
+    import tempfile, pandas as pd
+    from eeg_gpt.training.patient_sweep import profile_all_patients
+    dummy_df = pd.DataFrame({
+        "channel": ["TERM"] * 4,
+        "is_valid": [True] * 4,
+        "split": ["trn", "trn", "vld", "vld"],
+        "patient_id": ["patA", "patA", "patB", "patB"],
+        "session_id": ["s01", "s02", "s01", "s02"],
+        "session_key": ["trn_patA_s01", "trn_patA_s02", "vld_patB_s01", "vld_patB_s02"],
+        "start_time": [0.0, 10.0, 0.0, 10.0],
+        "stop_time": [4.0, 14.0, 4.0, 14.0],
+        "label": ["bg", "fnsz", "bg", "gnsz"],
+    })
+    with tempfile.NamedTemporaryFile(suffix=".csv", mode="w", delete=False) as f:
+        dummy_df.to_csv(f.name, index=False)
+        dummy_csv = f.name
+    try:
+        profs_trn = profile_all_patients(dummy_csv, window_s=4.0, cv_folds=2, min_preictal=1, min_sessions=1, min_background=1, split="trn")
+        assert [p["patient_id"] for p in profs_trn] == ["patA"]
+        profs_all = profile_all_patients(dummy_csv, window_s=4.0, cv_folds=2, min_preictal=1, min_sessions=1, min_background=1)
+        assert set(p["patient_id"] for p in profs_all) == {"patA", "patB"}
+    finally:
+        os.remove(dummy_csv)
+
+    print("patient_id parsing ok")
+
+
 def test_patient_sweep_and_cv(ck, csv, root):
     from eeg_gpt.training import finetune, patient_sweep
     pre = os.path.join(root, "pre")
@@ -311,6 +372,7 @@ def main():
         assert it["tokens"].shape == (C, 2, 1024)
         test_training_loader_speed_settings()
         test_max_gpu_usage_flag()
+        test_patient_id_parsing()
         test_tokenizer(); test_gpt_causal(); test_metrics(); test_pooled_sampling(ck); test_pretrain_learns(ck); test_finetune(ck, csv, root); test_adaptive(ck, csv, root)
         test_patient_sweep_and_cv(ck, csv, root)
         test_cv_pipeline(ck, csv, root)

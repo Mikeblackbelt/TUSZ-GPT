@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from eeg_gpt.data.datasets import LabeledWindows, patient_id, session_number
+from eeg_gpt.data.datasets import LabeledWindows, _SPLIT_PREFIXES, patient_id, session_number
 from eeg_gpt.data.label_utils import (
     LABEL_CATEGORY_BACKGROUND, LABEL_CATEGORY_EXCLUDED, LABEL_CATEGORY_ICTAL, LABEL_CATEGORY_PREICTAL,
     classify_label, extract_seizure_type,
@@ -132,6 +132,7 @@ def profile_all_patients(
     min_preictal: int = 5,
     min_sessions: int = 2,
     min_background: int = 20,
+    split: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Analyzes all patients in the master CSV and ranks ideal candidates."""
     df = pd.read_csv(master_csv)
@@ -139,14 +140,34 @@ def profile_all_patients(
         df = df[df["channel"].astype(str).str.upper() == "TERM"]
     if "is_valid" in df.columns:
         df = df[df["is_valid"].astype(str).str.lower().isin(["true", "1", "1.0"]) | (df["is_valid"] == True)]  # noqa: E712
+    if split is not None and "split" in df.columns:
+        df = df[df["split"].astype(str) == split]
 
     df = df.copy()
     df["_cat"] = df["label"].apply(classify_label)
-    df["_patient_id"] = df["session_key"].apply(patient_id)
+
+    # Use explicit patient_id / patient column if present, else extract from session_key
+    if "patient_id" in df.columns:
+        df["_patient_id"] = df["patient_id"].astype(str)
+    elif "patient" in df.columns:
+        df["_patient_id"] = df["patient"].astype(str)
+    else:
+        df["_patient_id"] = df["session_key"].apply(patient_id)
+
+    # Use explicit session_id / session column if present, else use session_key
+    if "session_id" in df.columns:
+        df["_session_id"] = df["session_id"].astype(str)
+    elif "session" in df.columns:
+        df["_session_id"] = df["session"].astype(str)
+    else:
+        df["_session_id"] = df["session_key"].astype(str)
 
     profiles = []
     for pid, pdf in df.groupby("_patient_id"):
-        sess_list = sorted(pdf["session_key"].unique().tolist(), key=session_number)
+        pid_str = str(pid).strip()
+        if not pid_str or pid_str.lower() in _SPLIT_PREFIXES or pid_str.lower() in {"unknown", "none", "proc", "raw", "nan"}:
+            continue
+        sess_list = sorted(pdf["_session_id"].unique().tolist(), key=session_number)
         n_sessions = len(sess_list)
         n_rows = len(pdf)
         n_pre = int((pdf["_cat"] == LABEL_CATEGORY_PREICTAL).sum())
@@ -160,7 +181,7 @@ def profile_all_patients(
         # seizure amount and variety: an event = a run of ictal rows without a gap, typed by its first row
         seizure_types: dict[str, int] = {}
         sessions_with_seizure = 0
-        for _, sdf in pdf[pdf["_cat"] == LABEL_CATEGORY_ICTAL].sort_values("start_time").groupby("session_key"):
+        for _, sdf in pdf[pdf["_cat"] == LABEL_CATEGORY_ICTAL].sort_values("start_time").groupby("_session_id"):
             sessions_with_seizure += 1
             new_event = (sdf["start_time"] - sdf["stop_time"].shift()).fillna(np.inf).values > 0.5 * window_s
             for lab in sdf["label"].values[new_event]:
@@ -658,6 +679,7 @@ def run_patient_sweep(args: Any) -> list[dict[str, Any]]:
         min_preictal=args.min_preictal,
         min_sessions=args.min_sessions,
         min_background=args.min_background,
+        split=getattr(args, "split", getattr(args, "train_split", None)),
     )
 
     # Save profiles
@@ -762,6 +784,7 @@ def build_parser():
     p.add_argument("--sweep-patients", action="store_true", help="Sweep all patients in master CSV to find ideal candidates")
     p.add_argument("--sweep-profile-only", action="store_true", help="Profile and rank candidates without training")
     p.add_argument("--sweep-top-k", type=int, default=5, help="Number of top candidates to benchmark in sweep (0 for all)")
+    p.add_argument("--split", default=None, help="Filter master CSV to a specific split (e.g. 'train' or 'trn')")
 
     # Candidate criteria
     p.add_argument("--min-preictal", type=int, default=5, help="Minimum preictal windows for an ideal candidate (default 5 for 5-fold CV)")
