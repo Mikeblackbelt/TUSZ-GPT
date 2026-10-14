@@ -27,6 +27,7 @@ from typing import Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def _rotate(x, cos, sin):
@@ -202,7 +203,7 @@ class WindowEncoder(nn.Module):
                  dropout: float = 0.1, pool: str = "mean", seq_chunk: int = 256):
         super().__init__()
         self.backbone = backbone
-        self.seq_chunk = seq_chunk   # channel-sequences per backbone call (bounds activation memory)
+        self.seq_chunk = seq_chunk   # channel-sequences per backbone call; with grad, each chunk is recomputed in backward
         d = backbone.d
         self.pool = pool
         self.frozen = False          # set by freeze(): backbone runs in eval mode without a graph
@@ -239,7 +240,10 @@ class WindowEncoder(nn.Module):
         ch = torch.arange(C, device=tokens.device).repeat(B)                 # (B*C,)
         flat = tokens.reshape(B * C, T)
         with torch.set_grad_enabled(torch.is_grad_enabled() and not self.frozen):
-            v = torch.cat([self._pooled(flat[i: i + self.seq_chunk], ch[i: i + self.seq_chunk])
+            # under autograd every chunk's activations would stay alive until backward (B*C*N sequences of T tokens);
+            # checkpointing keeps only the pooled (b, d) output per chunk and recomputes the chunk in backward
+            pooled = (lambda t, c: checkpoint(self._pooled, t, c, use_reentrant=False)) if torch.is_grad_enabled() else self._pooled
+            v = torch.cat([pooled(flat[i: i + self.seq_chunk], ch[i: i + self.seq_chunk])
                            for i in range(0, B * C, self.seq_chunk)], 0)
         v = v.view(B, C, -1) + self.ch_pos.weight[:C].unsqueeze(0)
         x = torch.cat([self.cls.expand(B, -1, -1), v], dim=1)               # (B, 1+C, d)
