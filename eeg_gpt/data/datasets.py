@@ -37,6 +37,7 @@ from .label_utils import (
     SEIZURE_TYPE_CLASSES, TYPE_GROUPINGS, classify_label, extract_seizure_type,
 )
 from .tokenizer import AmplitudeTokenizer
+from .events import events_from_rows
 
 log = logging.getLogger("eeg_gpt.data")
 
@@ -86,8 +87,19 @@ def _map_unique(col: pd.Series, fn) -> pd.Series:
     return col.map({v: fn(v) for v in col.unique()})
 
 
+def _event_window_s(df: pd.DataFrame) -> float:
+    """The CSV's window length (median row duration): the gap under which two ictal rows are one seizure."""
+    try:
+        d = float(np.nanmedian((df["stop_time"] - df["start_time"]).values.astype(np.float64)))
+        return d if np.isfinite(d) and d > 0 else 4.0
+    except Exception:
+        return 4.0
+
+
 def load_master(master_csv: str) -> pd.DataFrame:
-    """The labeled rows of the master CSV (TERM channel, is_valid) with `_patient`, `_cat` and `_type_raw` added.
+    """The labeled rows of the master CSV (TERM channel, is_valid) with `_patient`, `_cat`, `_type_raw`, the seizure
+    event columns of data/events.py (`_event_id`, `_event_start`, `_event_stop`, `_next_event_start`,
+    `_prev_event_stop`) and `_postictal` (False here) added.
 
     Read and parsed once per process (keyed on path, size and mtime): the patient CV builds 11 datasets per
     patient, and each used to re-read and re-parse the whole CSV. Callers must not modify the returned frame.
@@ -108,10 +120,16 @@ def load_master(master_csv: str) -> pd.DataFrame:
     df["_patient"] = _map_unique(df["session_key"], patient_id)
     df["_cat"] = _map_unique(df["label"], classify_label)
     df["_type_raw"] = _map_unique(df["label"], extract_seizure_type)
+    # seizure events (data/events.py): computed on the full frame so the SOP-buffer / postictal rows dropped later
+    # still count; the window length only sets the merge gap between ictal rows of one seizure
+    df = events_from_rows(df, window_s=_event_window_s(df))
+    df["_postictal"] = False      # set by LabeledWindows from --postictal-exclude-s via events.postictal_mask
     _MASTER_CACHE.clear()
     _MASTER_CACHE[key] = df
     log.info(f"master CSV {master_csv}: {n_all} rows read, {len(df)} labeled TERM rows kept, "
-             f"{df['_patient'].nunique()} patients, {df['session_key'].nunique()} sessions ({time.time() - t0:.1f}s, cached for this process)")
+             f"{df['_patient'].nunique()} patients, {df['session_key'].nunique()} sessions, "
+             f"{df.loc[df['_event_id'] >= 0, '_event_id'].nunique()} seizure events "
+             f"({time.time() - t0:.1f}s, cached for this process)")
     return df
 
 # per-process cache accounting: every DataLoader worker is its own process with its own share of RAM
@@ -258,7 +276,7 @@ class PretrainSessions(Dataset):
         self.sessions = sessions if sessions is not None else self.store.list_sessions()
         if not self.sessions:
             raise ValueError(f"no *_{stage}.parquet sessions under {checkpoint_dir}")
-        lengths = np.array([max(0, self.store.n_samples(s) - self.block - 1) for s in self.sessions], dtype=np.float64)
+        lengths = np.array([max(0, self.store.n_samples(s) - self.block - self.tok.patch) for s in self.sessions], dtype=np.float64)
         self.store.flush_index()
         keep = lengths > 0
         self.sessions = [s for s, k in zip(self.sessions, keep) if k]
@@ -296,11 +314,20 @@ class PretrainSessions(Dataset):
         arr = self.store.get(s)
         C, T = arr.shape
         c = int(rng.integers(0, C))
-        t0 = int(rng.integers(0, T - self.block - 1))
-        x = arr[c: c + 1, t0: t0 + self.block + 1]
+        patch = self.tok.patch
+        # crop = block + patch samples so every input position has a next-sample / next-patch target
+        t0 = int(rng.integers(0, max(1, T - self.block - patch)))
+        x = arr[c: c + 1, t0: t0 + self.block + patch]
         mu, sd = self._stats(s, arr)
-        tokens, z, _ = self.tok.encode(x, None if mu is None else mu[c: c + 1], None if sd is None else sd[c: c + 1])
-        return torch.from_numpy(tokens[0]), torch.from_numpy(z[0]), torch.tensor(c, dtype=torch.long)
+        if mu is not None:
+            mu, sd = mu[c: c + 1], sd[c: c + 1]
+        elif self.tok.norm_scope == "lead4s":
+            # leak-free: statistics of the first 1024 samples (4 s at 256 Hz) of the crop only, so the
+            # causal model never sees a normalisation that used its own future
+            mu, sd = self.tok.lead_stats(x)
+        tokens, z, _ = self.tok.encode(x, mu, sd)
+        inp = torch.from_numpy(z[0]) if patch > 1 else torch.from_numpy(tokens[0])
+        return inp, torch.from_numpy(z[0]), torch.tensor(c, dtype=torch.long)
 
 
 class LabeledWindows(Dataset):
@@ -314,17 +341,26 @@ class LabeledWindows(Dataset):
       "horizon_pos": float         -- 1 if a seizure onset lies within `horizon_s` after the window (Mahdi-style label)
       "type_idx": long             -- seizure type index (grouped), -1 if none
       "is_ictal": float
-      "time_to_onset": float       -- seconds, or -1
+      "time_to_onset": float       -- seconds to the next seizure EVENT onset (data/events.py), or -1
+      "feats":    (2F,) float      -- data/features.py context_features of the RAW signal (last block, delta vs the
+                                      previous blocks); empty tensor when feat_branch == "none"
+      "log_sd":   (C, N) float     -- log raw sd per block and channel (the amplitude the z-scoring removes)
       "row_idx": long, "session_idx": long
     }
+    `tokens` is whatever the tokenizer's encode_blocks() emits as model input: int64 levels for a token trunk,
+    float32 z for a patch trunk. `postictal_exclude_s` > 0 sets occ_valid = 0 on background rows that start within
+    that many seconds after the previous seizure of the session (events.postictal_mask).
     """
 
     def __init__(self, master_csv: str, checkpoint_dir: str, split: Optional[str] = None, stage: str = "proc",
                  window_s: float = 4.0, fs: float = 256.0, context_blocks: int = 1, horizon_s: float = 30.0,
                  type_grouping: str = "focal_generalized", tokenizer: Optional[AmplitudeTokenizer] = None,
                  cache_capacity: int = 8, keep_ictal: bool = True, sessions: Optional[list] = None,
-                 patient: Optional[str] = None, row_indices: Optional[list[int] | np.ndarray] = None):
+                 patient: Optional[str] = None, row_indices: Optional[list[int] | np.ndarray] = None,
+                 feat_branch: str = "none", postictal_exclude_s: float = 0.0):
         t0 = time.time()
+        self.feat_branch = feat_branch or "none"
+        self.postictal_exclude_s = float(postictal_exclude_s or 0.0)
         df = load_master(master_csv)
         if split and "split" in df.columns:
             df = df[df["split"].astype(str) == split]
@@ -374,6 +410,10 @@ class LabeledWindows(Dataset):
         is_ictal = np.zeros(n_rows, dtype=np.float32)
         time_to_onset = np.full(n_rows, -1.0, dtype=np.float32)
         session_idx = np.zeros(n_rows, dtype=np.int64)
+        # time to the next seizure EVENT onset (events.py columns, computed on the full frame before the SOP-buffer
+        # rows were dropped); the per-ictal-row onsets are the fallback for frames without the event columns
+        next_onset = (self.df["_next_event_start"].values.astype(np.float64) if "_next_event_start" in self.df.columns
+                      else None)
 
         for i in range(n_rows):
             k = self._session_keys[i]
@@ -388,13 +428,24 @@ class LabeledWindows(Dataset):
                 is_ictal[i] = 1.0
             if is_ict or is_pre:
                 type_idx[i] = self._raw_type_idxs[i]
-            ons = self.onsets.get(k, [])
-            pos = bisect.bisect_left(ons, g_stop)
-            tto = (ons[pos] - g_stop) if pos < len(ons) else -1.0
+            if next_onset is not None:
+                tto = (next_onset[i] - g_stop) if np.isfinite(next_onset[i]) else -1.0
+            else:
+                ons = self.onsets.get(k, [])
+                pos = bisect.bisect_left(ons, g_stop)
+                tto = (ons[pos] - g_stop) if pos < len(ons) else -1.0
             time_to_onset[i] = float(tto)
             if 0.0 <= tto <= self.horizon_s:
                 horizon_pos[i] = 1.0
             session_idx[i] = self.session_idx[k]
+
+        if self.postictal_exclude_s > 0:
+            from .events import postictal_mask
+            post = postictal_mask(self.df, self.postictal_exclude_s).values & (self._cats == LABEL_CATEGORY_BACKGROUND)
+            occ_valid[post] = 0.0
+            self.df["_postictal"] = post
+            log.info(f"LabeledWindows: {int(post.sum())} background rows within {self.postictal_exclude_s:.0f}s after a "
+                     f"seizure excluded from the binary labels (--postictal-exclude-s)")
 
         self._occ = torch.from_numpy(occ)
         self._occ_valid = torch.from_numpy(occ_valid)
@@ -414,6 +465,14 @@ class LabeledWindows(Dataset):
         if self.store.channels is None:
             self.store.get(self.sessions[0])
         return len(self.store.channels)
+
+    @property
+    def feat_dim(self) -> int:
+        """Length of the `feats` vector (0 when feat_branch == 'none'); reads one recording for the channel count."""
+        if self.feat_branch == "none":
+            return 0
+        from .features import feat_dim
+        return feat_dim(self.n_channels)
 
     def counts(self) -> dict:
         d = self.df
@@ -439,10 +498,22 @@ class LabeledWindows(Dataset):
                 x_total[:, L - e:] = arr[:, :e]
             x_total = x_total.reshape(C, self.N, self.T)
 
-        t_all, z_all, _ = self.tok.encode(x_total)
+        if hasattr(self.tok, "encode_blocks"):
+            enc = self.tok.encode_blocks(x_total)
+            inp, z_all, log_sd = enc["inp"], enc["z"], enc["log_sd"]
+        else:                                           # older tokenizer: per-block z-score, token input
+            inp, z_all, _ = self.tok.encode(x_total)
+            log_sd = np.log(x_total.std(axis=-1) + 1e-8).astype(np.float32)
+        if self.feat_branch != "none":
+            from .features import context_features
+            feats = torch.from_numpy(context_features(x_total, self.fs))
+        else:
+            feats = torch.zeros(0, dtype=torch.float32)
         return {
-            "tokens": torch.from_numpy(t_all),
-            "z_last": torch.from_numpy(z_all[:, -1, :]),
+            "tokens": torch.from_numpy(np.ascontiguousarray(inp)),
+            "z_last": torch.from_numpy(np.ascontiguousarray(z_all[:, -1, :])),
+            "feats": feats,
+            "log_sd": torch.from_numpy(np.ascontiguousarray(log_sd)),
             "occ": self._occ[i],
             "occ_valid": self._occ_valid[i],
             "horizon_pos": self._horizon_pos[i],

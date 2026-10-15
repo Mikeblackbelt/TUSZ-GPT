@@ -210,19 +210,43 @@ def load_pretrain_state(out):
 def pretrain_markdown(plan):
     lines = ["# Pretraining cross-validation", "",
              f"Held out for patient-specific training (never pretrained on): {', '.join(plan['held_out']) or '-'}", "",
-             "| fold | train patients | train sessions | val patients | val sessions | best step | val ce@1 | val ppl@1 | val loss |", "|---|---|---|---|---|---|---|---|---|"]
-    ces = []
+             "Floors: what copying the previous sample (copy) and a least-squares AR(8) predictor (ar8) score on the same held-out "
+             "batches; a model near the floor has learned the local autocorrelation and little else. probe = AUROC of a linear "
+             "probe on the frozen trunk's pooled features for preictal vs background windows of the held-out patients; band-power = "
+             "the same probe on hand-crafted features of the same windows (the trunk is useful when probe > band-power).", "",
+             "| fold | train patients | train sessions | val patients | val sessions | best step | objective (model) | floors copy / ar8 | ppl@1 | probe AUROC | band-power AUROC | val loss |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    ces, probes, bps = [], [], []
     for f in plan["folds"]:
         r = f.get("result")
         if not r:
-            lines.append(f"| {f['fold']} | | | {len(f['val_patients'])} | | not finished | | | |")
+            lines.append(f"| {f['fold']} | | | {len(f['val_patients'])} | | not finished | | | | | | |")
             continue
-        ce = r["val"].get("ce@1", float("nan")); ces.append(ce)
-        lines.append(f"| {f['fold']} | {r['train_patients']} | {r['train_sessions']} | {r['val_patients']} | {r['val_sessions']} | {r['best_step']} | "
-                     f"{_fmt(ce, 4)} | {_fmt(math.exp(min(20.0, ce)), 1)} | {_fmt(r['val'].get('loss', float('nan')), 4)} |")
+        v = r.get("val", {}) or {}
+        if v.get("mse_patch") is not None:
+            model_s = f"mse_patch {_fmt(v.get('mse_patch'), 4)}"
+            floors = f"{_fmt(v.get('mse_copy_patch'), 4)} / {_fmt(v.get('mse_ar8'), 4)}"
+            ppl = "n/a"
+        else:
+            ce = v.get("ce@1", float("nan"))
+            ce = float("nan") if ce is None else float(ce); ces.append(ce)
+            model_s = f"ce@1 {_fmt(ce, 4)}"
+            floors = f"{_fmt(v.get('ce_copy'), 4)} / {_fmt(v.get('ce_ar8'), 4)}"
+            ppl = _fmt(math.exp(min(20.0, ce)), 1) if not math.isnan(ce) else "n/a"
+        pr, bp = v.get("probe_auroc"), v.get("bandpower_auroc")
+        if isinstance(pr, (int, float)) and not math.isnan(pr):
+            probes.append(float(pr))
+        if isinstance(bp, (int, float)) and not math.isnan(bp):
+            bps.append(float(bp))
+        lines.append(f"| {f['fold']} | {r.get('train_patients', '')} | {r.get('train_sessions', '')} | {r.get('val_patients', '')} | "
+                     f"{r.get('val_sessions', '')} | {r.get('best_step', '')} | {model_s} | {floors} | {ppl} | {_fmt(pr)} | {_fmt(bp)} | "
+                     f"{_fmt(v.get('loss'), 4)} |")
     ces = [c for c in ces if not math.isnan(c)]
     if ces:
         lines += ["", f"Held-out ce@1 over {len(ces)} folds: **{_pm(float(np.mean(ces)), float(np.std(ces)), 4)}**"]
+    if probes:
+        lines += ["", f"Probe AUROC over {len(probes)} folds: **{_pm(float(np.mean(probes)), float(np.std(probes)))}**"
+                      + (f" vs band-power **{_pm(float(np.mean(bps)), float(np.std(bps)))}**" if bps else "")]
     return "\n".join(lines) + "\n"
 
 
@@ -272,35 +296,108 @@ def run_finetune_cv(args, patients, plan, profiles):
     return run_dir
 
 
+def _num(v):
+    """float or NaN for anything a fold record may hold (None, missing, nested)."""
+    return float(v) if isinstance(v, (int, float)) and not (isinstance(v, float) and math.isnan(v)) else float("nan")
+
+
+def _cv_mean(cv, key, fold_key=None, sub=None):
+    """`cv[key]` when the summary has it, else the mean over folds of `fold_key` (or `fold[sub][fold_key]`), finite values only."""
+    v = _num(cv.get(key))
+    if not math.isnan(v):
+        return v
+    vals = []
+    for f in cv.get("folds", []):
+        src = f.get(sub) if sub else f
+        if isinstance(src, dict):
+            vals.append(_num(src.get(fold_key or key)))
+    vals = [x for x in vals if not math.isnan(x)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _fold_sens90(f):
+    v = _num(f.get("sens_spec90"))
+    return v if not math.isnan(v) else _num((f.get("sens_at_spec") or {}).get("spec90"))
+
+
+def _strategy(cv):
+    strat = cv.get("strategy_per_fold") or [f.get("strategy") for f in cv.get("folds", [])]
+    strat = sorted({str(x) for x in strat if x})
+    return ", ".join(strat) if strat else "n/a"
+
+
+def _valid_folds(cv):
+    n = cv.get("n_folds_valid")
+    folds = cv.get("folds", [])
+    if n is None:
+        n = sum(1 for f in folds if not math.isnan(_num(f.get("auroc"))))
+    return f"{n}/{len(folds)}" if folds else "n/a"
+
+
+HOW_TO_READ = ("How to read: **AUROC (selected)** is the eval fold's window AUROC at the epoch chosen on the inner validation split "
+               "(or the last epoch when there was none) - the honest number. **oracle** is the best epoch chosen on the eval fold "
+               "itself (what the old pipeline reported; optimistic by the epoch-selection noise). **baseline** is a logistic "
+               "regression on hand-crafted features (band powers + log amplitude) of the same windows: the floor the model must "
+               "beat; `eeg_gpt.stats --metric baseline_delta` tests the difference. **smooth15** is the AUROC after a causal "
+               "15-window moving average of the scores. **sens@spec90** is the sensitivity at 90 % specificity with the "
+               "threshold taken from the validation split when there was one. Event sens / FA/h are seizure-level: the fraction "
+               "of seizures with an alarm in their preictal span and false alarms per hour; compare sens with the chance level "
+               "printed in the fold table. Chance for a window AUROC is 0.5; with ~200 preictal windows per patient, +-0.05 is noise.")
+
+
 def finetune_markdown(run, per_fold=False):
-    lines = [f"Stage 2 arguments: `{run['finetune_args'] or '(defaults)'}` | {run['cv_folds']}-fold CV per patient | Stage 1 checkpoints: {run['pretrain_select']}", "",
-             "| patient | seizures | seizure types | preictal / background rows | AUROC | balanced acc. | sens@spec80 | sens@spec90 | initialised from |",
-             "|---|---|---|---|---|---|---|---|---|"]
-    aurocs = []
-    for r in run["patients"]:
-        pr = r["profile"]
-        head = (f"| {r['patient_id']} | {pr['n_seizures']} | {', '.join(f'{t} ×{n}' for t, n in pr['seizure_types'].items()) or '-'} | "
-                f"{pr['n_preictal']} / {pr['n_background']} | ")
+    lines = [f"Stage 2 arguments: `{run.get('finetune_args') or '(defaults)'}` | {run.get('cv_folds', '?')}-fold CV per patient | "
+             f"Stage 1 checkpoints: {run.get('pretrain_select', '?')}", "",
+             "| patient | seizures | seizure types | preictal / background rows | AUROC (selected) | oracle | baseline | smooth15 | "
+             "sens@spec90 | strategy | valid folds | initialised from |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    aurocs, bases, oracles = [], [], []
+    for r in run.get("patients", []):
+        pr = r.get("profile", {})
+        head = (f"| {r.get('patient_id', '?')} | {pr.get('n_seizures', '')} | "
+                f"{', '.join(f'{t} x{n}' for t, n in (pr.get('seizure_types') or {}).items()) or '-'} | "
+                f"{pr.get('n_preictal', '')} / {pr.get('n_background', '')} | ")
         if "cv" not in r:
-            lines.append(head + f"failed: {r.get('error', '?')} | | | | {r['init']} |")
+            lines.append(head + f"failed: {r.get('error', '?')} | | | | | | | {r.get('init', '')} |")
             continue
         cv = r["cv"]
-        if not math.isnan(cv["mean_auroc"]):
-            aurocs.append(cv["mean_auroc"])
-        lines.append(head + f"{_pm(cv['mean_auroc'], cv['std_auroc'])} | {_pm(cv['mean_sweep_ba'], cv['std_sweep_ba'])} | "
-                            f"{_fmt(cv['mean_sens_at_spec80'])} | {_fmt(cv['mean_sens_at_spec90'])} | {r['init']} |")
+        a, o, bl = _num(cv.get("mean_auroc")), _cv_mean(cv, "mean_auroc_oracle", "auroc_oracle"), _cv_mean(cv, "mean_baseline_auroc", "baseline_auroc")
+        if not math.isnan(a):
+            aurocs.append(a)
+        if not math.isnan(bl):
+            bases.append(bl)
+        if not math.isnan(o):
+            oracles.append(o)
+        s90 = _cv_mean(cv, "mean_sens_spec90", "sens_spec90")
+        if math.isnan(s90):
+            s90 = _num(cv.get("mean_sens_at_spec90"))
+        lines.append(head + f"{_pm(a, _num(cv.get('std_auroc')))} | {_fmt(o)} | {_fmt(bl)} | "
+                            f"{_fmt(_cv_mean(cv, 'mean_auroc_smooth15', 'auroc_smooth15'))} | {_fmt(s90)} | {_strategy(cv)} | "
+                            f"{_valid_folds(cv)} | {r.get('init', '')} |")
     if aurocs:
-        lines += ["", f"Mean AUROC over {len(aurocs)} patients: **{_pm(float(np.mean(aurocs)), float(np.std(aurocs)))}** (± = spread between patients)"]
+        line = f"Mean AUROC (selected) over {len(aurocs)} patients: **{_pm(float(np.mean(aurocs)), float(np.std(aurocs)))}** (+- = spread between patients)"
+        if oracles:
+            line += f" | oracle {_fmt(float(np.mean(oracles)))}"
+        if bases:
+            line += f" | baseline {_fmt(float(np.mean(bases)))} | model - baseline {_fmt(float(np.mean(aurocs)) - float(np.mean(bases)))}"
+        lines += ["", line]
     if per_fold:
-        for r in run["patients"]:
+        for r in run.get("patients", []):
             if "cv" not in r:
                 continue
-            lines += ["", f"## Patient {r['patient_id']}", "",
-                      "| fold | train rows | eval rows | eval preictal | AUROC | balanced acc. | sens | spec | type macro-F1 | best epoch | Stage 1 checkpoint |",
-                      "|---|---|---|---|---|---|---|---|---|---|---|"]
-            for f in r["cv"]["folds"]:
-                lines.append(f"| {f['fold']} | {f['train_rows']} | {f['eval_rows']} | {f['eval_pos']} | {_fmt(f['auroc'])} | {_fmt(f['sweep_ba'])} | "
-                             f"{_fmt(f['sweep_sens'])} | {_fmt(f['sweep_spec'])} | {_fmt(f['type_macro_f1'])} | {f.get('best_epoch', '')} | {f.get('pretrained', '')} |")
+            lines += ["", f"## Patient {r.get('patient_id', '?')}", "",
+                      "| fold | train / val / eval rows | eval preictal | strategy | AUROC | oracle | last | baseline | smooth15 | balanced acc. | "
+                      "sens@spec90 | events sens / FA/h (chance) | type macro-F1 | epoch | Stage 1 checkpoint |",
+                      "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+            for f in r["cv"].get("folds", []):
+                ev = f.get("event") if isinstance(f.get("event"), dict) else {}
+                ev_s = (f"{_fmt(_num(ev.get('sens_events')), 2)} / {_fmt(_num(ev.get('fa_per_h')), 2)} ({_fmt(_num(ev.get('chance_sens')), 2)})"
+                        if ev else "n/a")
+                lines.append(f"| {f.get('fold', '')} | {f.get('train_rows', '')} / {f.get('val_rows', '-')} / {f.get('eval_rows', '')} | "
+                             f"{f.get('eval_pos', '')} | {f.get('strategy', 'n/a')} | {_fmt(_num(f.get('auroc')))} | {_fmt(_num(f.get('auroc_oracle')))} | "
+                             f"{_fmt(_num(f.get('auroc_last')))} | {_fmt(_num(f.get('baseline_auroc')))} | {_fmt(_num(f.get('auroc_smooth15')))} | "
+                             f"{_fmt(_num(f.get('sweep_ba')))} | {_fmt(_fold_sens90(f))} | {ev_s} | {_fmt(_num(f.get('type_macro_f1')))} | "
+                             f"{f.get('selected_epoch', f.get('best_epoch', ''))} | {f.get('pretrained', '')} |")
     return "\n".join(lines) + "\n"
 
 
@@ -308,7 +405,8 @@ def finetune_markdown(run, per_fold=False):
 
 def write_summary(out):
     """SUMMARY.md: the pretraining CV and every fine-tuning run found under <out>/finetune."""
-    parts = ["# EEG-GPT pipeline summary", "", f"Updated {time.strftime('%Y-%m-%d %H:%M:%S')}. Candidate ranking: [candidates.md](candidates.md).", ""]
+    parts = ["# EEG-GPT pipeline summary", "", f"Updated {time.strftime('%Y-%m-%d %H:%M:%S')}. Candidate ranking: [candidates.md](candidates.md).", "",
+             HOW_TO_READ, ""]
     plan = load_pretrain_state(out)
     if plan:
         md = pretrain_markdown(plan)

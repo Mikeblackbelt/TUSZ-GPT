@@ -13,7 +13,9 @@ same conventions as TUSZ-Seizure-Predict, then:
 """
 from __future__ import annotations
 
+import importlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -356,6 +358,17 @@ def test_cv_pipeline(ck, csv, root):
     assert not any(held[0] in f["val_patients"] for f in plan["folds"]), "held-out patient must not be in the pretraining corpus"
     run = json.load(open(os.path.join(out, "finetune", "first", "run.json")))
     assert len(run["patients"][0]["cv"]["folds"]) == 2
+    # wave-1 fold-record contract (protocol + recipe owners): honest selection next to the oracle number and the baseline
+    for f in run["patients"][0]["cv"]["folds"]:
+        for key in ("auroc", "auroc_oracle", "auroc_last", "selection", "strategy", "baseline_auroc", "auroc_smooth15"):
+            assert key in f, f"fold record misses '{key}': has {sorted(f)}"
+        a, o = f.get("auroc"), f.get("auroc_oracle")
+        if isinstance(a, float) and isinstance(o, float) and not math.isnan(a) and not math.isnan(o):
+            assert o >= a - 1e-9, f"oracle AUROC {o} below the selected AUROC {a}"
+    cv = run["patients"][0]["cv"]
+    assert "n_folds_valid" in cv, f"cv_summary misses n_folds_valid: has {sorted(cv)}"
+    text_first = open(os.path.join(out, "finetune", "first", "summary.md"), encoding="utf-8").read()
+    assert "oracle" in text_first and "baseline" in text_first
     # a patient that was pretrained on must not be fine-tuned patient-specifically from that pretraining
     other = plan["folds"][0]["val_patients"][0]
     try:
@@ -406,6 +419,17 @@ def main():
         test_patient_sweep_and_cv(ck, csv, root)
         test_cv_pipeline(ck, csv, root)
         test_stats(root)
+        # wave-1 per-area test modules (each owner wrote its own); a missing module is reported, not fatal
+        missing = []
+        for mod in ("test_recipe", "test_protocol", "test_arch", "test_stage1", "test_reporting"):
+            try:
+                m = importlib.import_module(f"eeg_gpt.tests.{mod}")
+            except ImportError as e:
+                print(f"{mod}: NOT RUN ({e})"); missing.append(mod); continue
+            m.main()
+            print(f"{mod} ok")
+        if missing:
+            print(f"WARNING: test modules not run: {missing}")
         print("ALL TESTS PASSED")
     finally:
         shutil.rmtree(root, ignore_errors=True)

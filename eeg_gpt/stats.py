@@ -3,6 +3,7 @@
     python -m eeg_gpt.stats --run ../runs/full_v3/finetune/ft_20261014_0312            # vs chance
     python -m eeg_gpt.stats --run ../runs/full_v3/finetune/ft_A --compare ../runs/x/finetune/ft_B   # A vs B
     python -m eeg_gpt.stats --run ../runs/full_v3 --metric sweep_ba --out stats.md
+    python -m eeg_gpt.stats --run ../runs/full_v3/finetune/ft_A --metric baseline_delta   # model minus feature baseline
 
 Reads every cv_summary.json under --run (one per patient, written by patient_sweep.run_patient_cv).
 
@@ -28,13 +29,37 @@ from typing import Optional
 import numpy as np
 from scipy import stats as st
 
-CHANCE = {"auroc": 0.5, "sweep_ba": 0.5, "spec80": 0.2, "spec90": 0.1, "type_macro_f1": None}
-METRICS = ["auroc", "sweep_ba", "spec80", "spec90", "type_macro_f1"]
+# chance level per metric (None = descriptive only). baseline_delta = auroc - baseline_auroc of the same fold, so its
+# chance level is 0 and a positive cohort effect means the model beats the hand-crafted-feature floor; auroc_oracle is the
+# old eval-fold-selected number (optimistic); sens_spec90 uses the validation-split threshold when the run had one;
+# event_sens / fa_per_h are seizure-level (compare event_sens with the fold's chance_sens, not with a fixed level).
+CHANCE = {"auroc": 0.5, "auroc_oracle": 0.5, "auroc_last": 0.5, "auroc_smooth15": 0.5, "auroc_norm": 0.5, "baseline_auroc": 0.5,
+          "baseline_delta": 0.0, "sweep_ba": 0.5, "spec80": 0.2, "spec90": 0.1, "sens_spec90": 0.1, "type_macro_f1": None,
+          "event_sens": None, "fa_per_h": None, "train_auroc": 0.5}
+METRICS = list(CHANCE)
 
 
 def _fold_value(f: dict, metric: str) -> float:
-    v = f.get("sens_at_spec", {}).get(metric) if metric in ("spec80", "spec90") else f.get(metric)
-    return float("nan") if v is None else float(v)
+    """One number of a fold record (NaN when the record does not have it)."""
+    if metric in ("spec80", "spec90"):
+        v = (f.get("sens_at_spec") or {}).get(metric)
+    elif metric == "baseline_delta":
+        a, b = f.get("auroc"), f.get("baseline_auroc")
+        v = None if a is None or b is None else float(a) - float(b)
+    elif metric == "sens_spec90":
+        v = f.get("sens_spec90")
+        if v is None:
+            v = (f.get("sens_at_spec") or {}).get("spec90")
+    elif metric == "event_sens":
+        v = (f.get("event") or {}).get("sens_events")
+    elif metric == "fa_per_h":
+        v = (f.get("event") or {}).get("fa_per_h")
+    else:
+        v = f.get(metric)
+    try:
+        return float("nan") if v is None else float(v)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def load_run(path: str, metric: str) -> dict[str, list[tuple[int, float]]]:
