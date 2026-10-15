@@ -20,7 +20,7 @@ def test_score_stats():
     assert r["n_pos"] == 3 and r["n_neg"] == 3 and r["frac_pos"] == 0.5
     assert r["separation"] > 2 and r["mean_logit_pos"] > 0 > r["mean_logit_neg"]
     flat = score_stats(np.full(10, 0.55), np.array([1] * 3 + [0] * 7))
-    assert flat["std"] == 0 and (math.isnan(flat["separation"]) or flat["separation"] == 0)
+    assert flat["std"] < 1e-9 and math.isnan(flat["separation"])     # constant scores: no separation, not a rounding artefact
     print("score_stats ok")
 
 

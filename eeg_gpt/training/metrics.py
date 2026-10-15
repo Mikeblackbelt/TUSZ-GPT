@@ -162,6 +162,8 @@ def score_stats(scores, targets) -> dict:
     logit = np.log(np.clip(s, eps, 1 - eps)) - np.log(np.clip(1 - s, eps, 1 - eps))
     lp, ln = logit[y == 1], logit[y == 0]
     pooled = math.sqrt(0.5 * (float(pos.var()) if len(pos) > 1 else 0.0) + 0.5 * (float(neg.var()) if len(neg) > 1 else 0.0))
+    if pooled < 1e-9:      # a constant predictor: rounding noise must not become a huge "separation"
+        pooled = 0.0
     return {"std": float(s.std()) if len(s) else float("nan"),
             "frac_pos": float((s > 0.5).mean()) if len(s) else float("nan"),
             "mean_logit_pos": float(lp.mean()) if len(lp) else float("nan"),
