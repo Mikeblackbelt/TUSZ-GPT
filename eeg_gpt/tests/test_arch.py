@@ -79,7 +79,8 @@ def test_forward_variants():
         m = SeizureModel(bb, C, 2, N, 0.1, "tail", feat_branch=fb, feat_dim=feat_dim(C), arch=dict(agg_dim=16), bandpower_idx=bp)
         m.set_feature_stats(np.zeros(feat_dim(C)), np.ones(feat_dim(C)))
         calls = []
-        h = m.encoder.backbone.register_forward_pre_hook(lambda *a: calls.append(1))
+        # the encoder calls backbone.hidden() directly (not forward), so hook a block that hidden() runs
+        h = m.encoder.backbone.blocks[0].register_forward_pre_hook(lambda *a: calls.append(1))
         run(m, with_feats=True)
         h.remove()
         if fb == "feat_only":
