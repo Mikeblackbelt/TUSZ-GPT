@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from eeg_gpt.data.datasets import LabeledWindows
+from eeg_gpt.data.tokenizer import AmplitudeTokenizer
 from eeg_gpt.data.features import N_FEATS_PER_CHANNEL, bandpower_indices, context_features, feat_dim, window_features
 from eeg_gpt.models.gpt import DEFAULT_ARCH, OLD_ARCH, EEGGPT, SeizureModel
 from eeg_gpt.tests.test_pipeline import C, FS, make_corpus
@@ -151,8 +152,9 @@ def test_probe_fold(ck, csv, root):
     pid = full.df["_patient"].iloc[0]
     n = int((full.df["_patient"] == pid).sum())
     idx = np.arange(n)
-    tr = LabeledWindows(csv, ck, split=None, patient=pid, context_blocks=2, window_s=1.0, row_indices=idx[: n // 2], feat_branch="full")
-    ev = LabeledWindows(csv, ck, split=None, patient=pid, context_blocks=2, window_s=1.0, row_indices=idx[n // 2:], feat_branch="full")
+    tok = AmplitudeTokenizer(N_LEVELS, 4.0)      # the datasets must quantise to the test trunk's 64 levels
+    tr = LabeledWindows(csv, ck, split=None, patient=pid, context_blocks=2, window_s=1.0, row_indices=idx[: n // 2], feat_branch="full", tokenizer=tok)
+    ev = LabeledWindows(csv, ck, split=None, patient=pid, context_blocks=2, window_s=1.0, row_indices=idx[n // 2:], feat_branch="full", tokenizer=tok)
     model = SeizureModel(_trunk(), C, 2, 2, 0.1, "tail", feat_branch="full", feat_dim=feat_dim(C), arch=dict(agg_dim=16))
     args = argparse.Namespace(eval_batch_size=64, batch_size=16, num_workers=0, amp=False, seed=0, smooth_k=15)
     out = os.path.join(root, "probe_fold")
