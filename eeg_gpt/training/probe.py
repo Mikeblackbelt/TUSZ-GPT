@@ -29,7 +29,7 @@ def _fit(X: torch.Tensor, y: torch.Tensor, l2: float, steps: int = 400, lr: floa
     opt = torch.optim.Adam([w, b], lr=lr)
     with torch.enable_grad():   # callers (pretrain.run_probe, the fine-tuner's evaluation) run under no_grad
         for _ in range(steps):
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(X @ w + b, y, pos_weight=pw) + l2 * (w * w).sum() / d
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(X @ w + b, y, pos_weight=pw) + l2 * (w * w).sum()
             opt.zero_grad(); loss.backward(); opt.step()
     return w.detach(), b.detach()
 

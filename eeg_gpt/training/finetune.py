@@ -99,11 +99,11 @@ def build_parser():
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--accum", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-5, help="trunk lr at the top block after unfreezing (see --llrd)")
-    p.add_argument("--head-lr", type=float, default=1e-3,
-                   help="learning rate for heads (default 1e-3, 3x higher than before)")
+    p.add_argument("--head-lr", type=float, default=3e-4,
+                   help="learning rate for heads (default 3e-4)")
     p.add_argument("--warmup-frac", type=float, default=0.05, help="fraction of optimizer steps spent in linear warmup")
-    p.add_argument("--weight-decay", type=float, default=0.05)
-    p.add_argument("--dropout", type=float, default=0.2)
+    p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--pool", choices=["mean", "last", "meanmax", "tail", "attn", "meanstd"], default="tail",
                    help="pooling of the trunk's positions per block (tail = mean over the last --pool-tail-frac of positions)")
     p.add_argument("--smooth-k", type=int, default=15)
@@ -126,12 +126,12 @@ def build_parser():
     p.add_argument("--n-levels", type=int, default=512, help="amplitude quantization levels")
     p.add_argument("--clip-k", type=float, default=4.0, help="tokenizer clip threshold")
     # --- recipe flags (owner: recipe implementer; insert new add_argument lines directly below this marker) ---
-    p.add_argument("--preictal-frac", type=float, default=0.25, help="fraction of every training batch reserved for preictal rows (0 = none reserved, today's sampler)")
+    p.add_argument("--preictal-frac", type=float, default=0.10, help="fraction of every training batch reserved for preictal rows (0 = none reserved, today's sampler)")
     p.add_argument("--pos-weight", default="auto", help="'auto' = background / preictal per batch after balancing (capped by --pos-weight-cap), or a fixed number")
     p.add_argument("--freeze-epochs", type=int, default=3, help="LP-FT: epochs with the trunk frozen before unfreezing it with layer-wise lr decay (0 = train everything from epoch 1)")
     p.add_argument("--llrd", type=float, default=0.65, help="layer-wise lr decay of the trunk after unfreezing: block i of L gets --lr * llrd^(L-1-i), embeddings --lr * llrd^L (1 = off)")
-    p.add_argument("--agg-lr", type=float, default=3e-4, help="lr of the channel aggregator / temporal context (everything that is neither trunk nor head)")
-    p.add_argument("--backbone-dropout", type=float, default=0.0, help="dropout inside the pretrained trunk during fine-tuning (it was pretrained with 0)")
+    p.add_argument("--agg-lr", type=float, default=1e-4, help="lr of the channel aggregator / temporal context (everything that is neither trunk nor head)")
+    p.add_argument("--backbone-dropout", type=float, default=0.1, help="dropout inside the pretrained trunk during fine-tuning (it was pretrained with 0)")
     p.add_argument("--ema", type=float, default=0.999, help="EMA decay of the weights used for evaluation and best.pt (0 = off)")
     p.add_argument("--type-head", choices=["auto", "on", "off"], default="auto", help="auto = off when the training fold has < 2 seizure types")
     p.add_argument("--select", choices=["inner", "none", "oracle"], default="inner",
@@ -158,10 +158,10 @@ def build_parser():
                    help="how the N block vectors become one: delta = newest + W(newest - mean of the previous ones)")
     p.add_argument("--encode-context", choices=["block", "whole"], default="block",
                    help="block: every block is its own trunk sequence; whole: the N blocks of a channel form one sequence")
-    p.add_argument("--feat-branch", choices=["none", "bandpower", "full", "feat_only"], default="full",
+    p.add_argument("--feat-branch", choices=["none", "bandpower", "full", "feat_only"], default="none",
                    help="hand-crafted features (data/features.py) fused with the trunk embedding; feat_only = features alone (the floor)")
     p.add_argument("--encode-tail", type=int, default=0, help="> 0: only the last N samples of every block go through the trunk")
-    p.add_argument("--head-hidden", type=int, default=None, help="hidden width of the two heads (default 2*d)")
+    p.add_argument("--head-hidden", type=int, default=None, help="hidden width of the two heads (default None = linear head)")
     # --- reporting flags (owner: reporting implementer; insert new add_argument lines directly below this marker) ---
     p.add_argument("--session-norm-k", type=int, default=150, help="windows of causal per-session score normalisation for the report-only auroc_norm (0 = off)")
     p.add_argument("--eval-threshold", type=float, default=None, help="alarm threshold for the event metrics (default: the threshold-sweep optimum of the evaluated set)")

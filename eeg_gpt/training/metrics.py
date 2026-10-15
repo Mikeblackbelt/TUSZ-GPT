@@ -29,18 +29,18 @@ def auroc(scores, targets) -> float:
 
 def threshold_sweep(scores, targets, n: int = 99) -> dict:
     s = np.asarray(scores, dtype=np.float64); y = np.asarray(targets, dtype=np.float64)
-    best = {"threshold": 0.5, "balanced_accuracy": 0.5, "sensitivity": 0.0, "specificity": 0.0}
     if len(s) == 0:
-        return best
+        return {"threshold": 0.5, "balanced_accuracy": 0.5, "sensitivity": 0.0, "specificity": 0.0}
+    best = None
     for thr in np.quantile(s, np.linspace(0.01, 0.99, n)):
         pred = (s >= thr).astype(np.float64)
         tp = ((pred == 1) & (y == 1)).sum(); fn = ((pred == 0) & (y == 1)).sum()
         tn = ((pred == 0) & (y == 0)).sum(); fp = ((pred == 1) & (y == 0)).sum()
         sens = tp / max(1, tp + fn); spec = tn / max(1, tn + fp)
         ba = 0.5 * (sens + spec)
-        if ba > best["balanced_accuracy"]:
+        if best is None or ba > best["balanced_accuracy"]:
             best = {"threshold": float(thr), "balanced_accuracy": float(ba), "sensitivity": float(sens), "specificity": float(spec)}
-    return best
+    return best if best is not None else {"threshold": float(np.median(s)), "balanced_accuracy": 0.5, "sensitivity": 0.0, "specificity": 0.0}
 
 
 def sensitivity_at_specificity(scores, targets, target_specificity: float = 0.90) -> float:

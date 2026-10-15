@@ -730,20 +730,25 @@ class TemporalContext(nn.Module):
 
 
 class Head(nn.Module):
-    """LayerNorm -> GELU -> Dropout -> Linear -> GELU -> Dropout -> Linear (Mahdi §III-F 2).
+    """LayerNorm -> Dropout -> Linear (or with hidden MLP layer if hidden > 0; Mahdi §III-F 2).
 
-    hidden defaults to 2*d (wider than the paper's d) for stronger non-linear
-    capacity at low parameter cost relative to the backbone.
+    Linear head by default for robust generalization on small seizure sets without
+    overparameterized non-linear memorization; hidden > 0 adds an intermediate MLP layer.
     """
 
     def __init__(self, d: int, n_out: int, dropout: float = 0.2, hidden: Optional[int] = None):
         super().__init__()
-        hidden = hidden or 2 * d
-        self.net = nn.Sequential(
-            nn.LayerNorm(d), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(d, hidden), nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(hidden, n_out),
-        )
+        if hidden and hidden > 0:
+            self.net = nn.Sequential(
+                nn.LayerNorm(d), nn.Dropout(dropout),
+                nn.Linear(d, hidden), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(hidden, n_out),
+            )
+        else:
+            self.net = nn.Sequential(
+                nn.LayerNorm(d), nn.Dropout(dropout),
+                nn.Linear(d, n_out),
+            )
 
     def forward(self, x):
         return self.net(x)
@@ -788,8 +793,8 @@ class SeizureModel(nn.Module):
             else:
                 self.feat_idx = None
                 fin = self.feat_dim
-            self.feat_net = nn.Sequential(nn.LayerNorm(fin), nn.Linear(fin, d), nn.GELU())
-            self.fuse = nn.Linear(2 * d, d) if feat_branch != "feat_only" else None
+            self.feat_net = nn.Sequential(nn.LayerNorm(fin), nn.Dropout(dropout), nn.Linear(fin, d), nn.GELU(), nn.Dropout(dropout))
+            self.fuse = nn.Sequential(nn.Dropout(dropout), nn.Linear(2 * d, d)) if feat_branch != "feat_only" else None
         hidden = a.get("head_hidden")
         self.binary_head = Head(d, 1, dropout, hidden=hidden)
         self.type_head = Head(d, n_types, dropout, hidden=hidden)

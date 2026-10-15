@@ -52,7 +52,10 @@ def resolve_pos_weight(setting: Any, cap: float, composition: dict, n_pos: int, 
     bg = float(composition.get("expected_background_per_batch", 0.0))
     if pre <= 0 or bg <= 0:
         pre, bg = float(max(1, n_pos)), float(n_neg)
-    return float(min(cap, max(1.0, bg / pre)))
+    raw = bg / pre
+    if float(composition.get("reserved_preictal", 0.0)) > 0:
+        return float(min(cap, min(2.0, max(1.0, raw))))
+    return float(min(cap, max(1.0, raw)))
 
 
 def type_head_enabled(mode: str, df) -> bool:
@@ -120,6 +123,7 @@ def param_groups(model: nn.Module, args: Any) -> list:
     agg_lr = float(getattr(args, "agg_lr", head_lr))
     lr = float(args.lr)
     llrd = float(getattr(args, "llrd", 1.0))
+    wd = float(getattr(args, "weight_decay", 0.0))
     seen, heads, agg, emb, top = set(), [], [], [], []
     layers: dict = {}
     for n, p in model.named_parameters():
@@ -140,16 +144,16 @@ def param_groups(model: nn.Module, args: Any) -> list:
             agg.append(p)
     groups = []
     if heads:
-        groups.append({"params": heads, "lr": head_lr, "name": "heads"})
+        groups.append({"params": heads, "lr": head_lr, "name": "heads", "weight_decay": wd})
     if agg:
-        groups.append({"params": agg, "lr": agg_lr, "name": "agg"})
+        groups.append({"params": agg, "lr": agg_lr, "name": "agg", "weight_decay": wd})
     L = (max(layers) + 1) if layers else 0
     if top:
-        groups.append({"params": top, "lr": lr, "name": "trunk.top"})
+        groups.append({"params": top, "lr": lr, "name": "trunk.top", "weight_decay": wd})
     for i in sorted(layers):
-        groups.append({"params": layers[i], "lr": lr * llrd ** (L - 1 - i), "name": f"trunk.block{i}"})
+        groups.append({"params": layers[i], "lr": lr * llrd ** (L - 1 - i), "name": f"trunk.block{i}", "weight_decay": wd})
     if emb:
-        groups.append({"params": emb, "lr": lr * llrd ** L, "name": "trunk.emb"})
+        groups.append({"params": emb, "lr": lr * llrd ** L, "name": "trunk.emb", "weight_decay": wd})
     return groups
 
 
