@@ -30,7 +30,7 @@ import time
 import numpy as np
 import torch
 
-from eeg_gpt.data.datasets import SessionStore, patient_id
+from eeg_gpt.data.datasets import SessionStore, patient_id, resolve_master_csv
 from eeg_gpt.training import finetune, pretrain
 from eeg_gpt.training.patient_sweep import format_candidates_table, profile_all_patients, run_patient_cv
 
@@ -426,6 +426,7 @@ def write_summary(out):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.master_csv = resolve_master_csv(args.master_csv)
     os.makedirs(args.out, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s",
                         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.out, "pipeline.log"))])

@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 
-from eeg_gpt.data.datasets import LabeledWindows, patient_id, session_number
+from eeg_gpt.data.datasets import LabeledWindows, patient_id, resolve_master_csv, session_number
 from eeg_gpt.data.tokenizer import AmplitudeTokenizer
 from eeg_gpt.models.gpt import EEGGPT, SeizureModel, count_params, focal_bce
 from eeg_gpt.training.device import (adapt_num_workers, get_amp_scaler, get_autocast_kwargs, get_device, make_adamw, parse_gpu_usage, resolve_amp,
@@ -415,6 +415,7 @@ def log_eval(res, tag, ds):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.master_csv = resolve_master_csv(args.master_csv)
     if args.patient and not args.adapt_patient:
         args.adapt_patient = args.patient
         if args.cv_folds is None:

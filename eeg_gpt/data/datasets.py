@@ -96,6 +96,19 @@ def _event_window_s(df: pd.DataFrame) -> float:
         return 4.0
 
 
+def resolve_master_csv(path: str) -> str:
+    """If path is a directory, search for master_full.csv, master.csv, or any master CSV in it."""
+    if os.path.isdir(path):
+        for candidate in ["master_full.csv", "master.csv"]:
+            p = os.path.join(path, candidate)
+            if os.path.isfile(p):
+                return p
+        for f in sorted(os.listdir(path)):
+            if f.endswith(".csv") and "master" in f.lower():
+                return os.path.join(path, f)
+    return path
+
+
 def load_master(master_csv: str) -> pd.DataFrame:
     """The labeled rows of the master CSV (TERM channel, is_valid) with `_patient`, `_cat`, `_type_raw`, the seizure
     event columns of data/events.py (`_event_id`, `_event_start`, `_event_stop`, `_next_event_start`,
@@ -104,6 +117,7 @@ def load_master(master_csv: str) -> pd.DataFrame:
     Read and parsed once per process (keyed on path, size and mtime): the patient CV builds 11 datasets per
     patient, and each used to re-read and re-parse the whole CSV. Callers must not modify the returned frame.
     """
+    master_csv = resolve_master_csv(master_csv)
     st = os.stat(master_csv)
     key = (os.path.abspath(master_csv), st.st_size, st.st_mtime_ns)
     df = _MASTER_CACHE.get(key)
@@ -158,6 +172,14 @@ class SessionStore:
     def __init__(self, checkpoint_dir: str, stage: str = "proc", capacity: int = 8, channels: Optional[list] = None):
         self.dir = checkpoint_dir
         self.stage = stage
+        if os.path.isdir(self.dir):
+            suf = f"_{self.stage}.parquet"
+            if not any(f.endswith(suf) for f in os.listdir(self.dir)):
+                for sub in ["checkpoints", "ckpt", "proc", "parquet"]:
+                    sub_path = os.path.join(self.dir, sub)
+                    if os.path.isdir(sub_path) and any(f.endswith(suf) for f in os.listdir(sub_path)):
+                        self.dir = sub_path
+                        break
         self.capacity = max(1, int(capacity))
         self.channels = channels
         self._cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
