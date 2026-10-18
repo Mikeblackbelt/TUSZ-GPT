@@ -348,8 +348,8 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
              spec_weight: float = 1.0) -> dict:
     """Token path -- tokens/z: (B, block+1). Input = tokens[:, :-1]; the head for offset o at
     position t predicts tokens[:, t+o]. CE on every offset (offsets > 1 weighted
-    by aux_weight); the Mahdi dual MSE (dequantized expected level vs true z) on
-    the offset-1 head.
+    by aux_weight); composite cross-entropy is normalized by the sum of CE head weights;
+    the Mahdi dual MSE (dequantized expected level vs true z) on the offset-1 head.
 
     `ce@o` is always the plain cross-entropy, so runs stay comparable whatever
     the loss weights are. label_smoothing only changes the optimized `loss`:
@@ -369,9 +369,11 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
     inp = tokens[:, :-1]
     logits, _ = model(inp, channel)
     T = inp.shape[1]
-    out = {"loss": inp.new_zeros((), dtype=torch.float32)}
+    out = {}
     dequant = getattr(model, "dequant", "edge")
     level_vals = tokenizer.level_values(tokens.device, dequant)  # (L,)
+    ce_loss_sum = inp.new_zeros((), dtype=torch.float32)
+    ce_weight_sum = 0.0
     for o in model.pred_offsets:
         lg = logits[str(o)][:, : T - (o - 1)]          # positions with a target o steps ahead
         tgt = tokens[:, o: o + lg.shape[1]]
@@ -379,7 +381,9 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
         ce = F.cross_entropy(flat_lg, flat_tgt)
         out[f"ce@{o}"] = ce
         opt_ce = F.cross_entropy(flat_lg, flat_tgt, label_smoothing=label_smoothing) if label_smoothing > 0 else ce
-        out["loss"] = out["loss"] + (1.0 if o == 1 else aux_weight) * opt_ce
+        w_o = 1.0 if o == 1 else aux_weight
+        ce_loss_sum = ce_loss_sum + w_o * opt_ce
+        ce_weight_sum += w_o
         with torch.no_grad():
             out[f"acc@{o}"] = (lg.argmax(-1) == tgt).float().mean()
         if o == 1 and lambda_mse > 0:
@@ -391,7 +395,12 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
                 z_hat = (p * level_vals[None, None, :]).sum(-1)
                 mse = F.mse_loss(z_hat, z[:, 1: 1 + lg.shape[1]].float())  # sigma^2 units (historical)
             out["mse"] = mse
-            out["loss"] = out["loss"] + lambda_mse * mse
+    if ce_weight_sum > 0:
+        out["loss"] = ce_loss_sum / ce_weight_sum
+    else:
+        out["loss"] = ce_loss_sum
+    if "mse" in out and lambda_mse > 0:
+        out["loss"] = out["loss"] + lambda_mse * out["mse"]
     with torch.no_grad():
         out.update(_token_floors(tokens, z, tokenizer))
     return out

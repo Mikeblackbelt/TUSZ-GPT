@@ -98,7 +98,8 @@ def build_parser():
                         "structure at multiple timescales (default: 1,8,32 = 4ms, 31ms, 125ms @ 256Hz)")
     p.add_argument("--lambda-mse", type=float, default=0.5,
                    help="MSE weight on dequantised amplitude (default 0.5, up from 0.1)")
-    p.add_argument("--aux-weight", type=float, default=0.5, help="loss weight of the offset > 1 heads (token) / coarse-horizon heads (patch)")
+    p.add_argument("--aux-weight", type=float, default=0.5,
+                   help="loss weight of the offset > 1 heads (token CE is normalized by the sum of CE head weights) / coarse-horizon heads (patch)")
     p.add_argument("--label-smoothing", type=float, default=0.0,
                    help="label smoothing on CE heads (off: it floors the loss at ~0.95 nats per head)")
     p.add_argument("--n-channels", type=int, default=20)
