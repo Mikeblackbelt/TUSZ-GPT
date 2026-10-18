@@ -99,6 +99,17 @@ def test_thresholds_and_stats():
     print("thresholds / score stats ok")
 
 
+def test_augment():
+    from eeg_gpt.data.datasets import _augment
+    torch.manual_seed(0)
+    x = np.random.default_rng(0).standard_normal((4, 2, 256)).astype(np.float32)
+    a, b = _augment(x, 0.1), _augment(x, 0.1)
+    assert a.shape == x.shape and a.dtype == np.float32 and not np.allclose(a, b)
+    assert np.allclose(_augment(x, 0.0), x)
+    r = np.corrcoef(a.ravel(), x.ravel())[0, 1]
+    assert r > 0.9, r       # a perturbation, not a different signal
+
+
 def _patient_split(csv, ck, pid, window_s, context_blocks):
     """train = first session, val = second, eval = third (session-disjoint), as row indices of the patient frame."""
     from eeg_gpt.data.datasets import LabeledWindows, session_number
@@ -183,7 +194,7 @@ def test_type_head_auto_off(root):
 def main():
     root = tempfile.mkdtemp(prefix="eeggpt_recipe_")
     try:
-        test_sampler_composition(); test_focal_bce(); test_init_heads_and_groups(); test_thresholds_and_stats()
+        test_sampler_composition(); test_focal_bce(); test_init_heads_and_groups(); test_thresholds_and_stats(); test_augment()
         ck, csv = make_corpus(root, n_patients=2, sessions_per_patient=3)
         test_fold_training(ck, csv, root)
         test_type_head_auto_off(root)

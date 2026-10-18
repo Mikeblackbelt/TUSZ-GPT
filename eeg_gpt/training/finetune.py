@@ -98,7 +98,7 @@ def build_parser():
     p.add_argument("--steps-per-epoch", type=int, default=0, help="0 = full pass")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--accum", type=int, default=4)
-    p.add_argument("--lr", type=float, default=1e-5, help="trunk lr at the top block after unfreezing (see --llrd)")
+    p.add_argument("--lr", type=float, default=5e-6, help="trunk lr at the top block after unfreezing (see --llrd)")
     p.add_argument("--head-lr", type=float, default=3e-4,
                    help="learning rate for heads (default 3e-4)")
     p.add_argument("--warmup-frac", type=float, default=0.05, help="fraction of optimizer steps spent in linear warmup")
@@ -128,7 +128,7 @@ def build_parser():
     # --- recipe flags (owner: recipe implementer; insert new add_argument lines directly below this marker) ---
     p.add_argument("--preictal-frac", type=float, default=0.10, help="fraction of every training batch reserved for preictal rows (0 = none reserved, today's sampler)")
     p.add_argument("--pos-weight", default="auto", help="'auto' = background / preictal per batch after balancing (capped by --pos-weight-cap), or a fixed number")
-    p.add_argument("--freeze-epochs", type=int, default=3, help="LP-FT: epochs with the trunk frozen before unfreezing it with layer-wise lr decay (0 = train everything from epoch 1)")
+    p.add_argument("--freeze-epochs", type=int, default=5, help="LP-FT: epochs with the trunk frozen before unfreezing it with layer-wise lr decay (0 = train everything from epoch 1)")
     p.add_argument("--llrd", type=float, default=0.65, help="layer-wise lr decay of the trunk after unfreezing: block i of L gets --lr * llrd^(L-1-i), embeddings --lr * llrd^L (1 = off)")
     p.add_argument("--agg-lr", type=float, default=1e-4, help="lr of the channel aggregator / temporal context (everything that is neither trunk nor head)")
     p.add_argument("--backbone-dropout", type=float, default=0.1, help="dropout inside the pretrained trunk during fine-tuning (it was pretrained with 0)")

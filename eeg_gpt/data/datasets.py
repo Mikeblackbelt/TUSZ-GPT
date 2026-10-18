@@ -352,6 +352,17 @@ class PretrainSessions(Dataset):
         return inp, torch.from_numpy(z[0]), torch.tensor(c, dtype=torch.long)
 
 
+def _augment(x: np.ndarray, strength: float) -> np.ndarray:
+    """x (C, N, T) raw -> per-channel amplitude scaling (+-strength) plus white noise at strength/2 of each
+    channel's sd (scaling alone is undone by the per-block z-score). Uses torch's RNG so DataLoader workers
+    draw independent streams."""
+    C = x.shape[0]
+    scale = (1.0 + strength * (2.0 * torch.rand(C).numpy() - 1.0)).astype(np.float32)
+    sd = x.reshape(C, -1).std(axis=1).astype(np.float32)
+    noise = torch.randn(x.shape).numpy() * (0.5 * strength * sd)[:, None, None]
+    return ((x + noise) * scale[:, None, None]).astype(np.float32, copy=False)
+
+
 class LabeledWindows(Dataset):
     """Rows of the master CSV -> per-channel tokens.
 
@@ -476,6 +487,7 @@ class LabeledWindows(Dataset):
         self._is_ictal = torch.from_numpy(is_ictal)
         self._time_to_onset = torch.from_numpy(time_to_onset)
         self._session_idx = torch.from_numpy(session_idx)
+        self.augment = 0.0      # training-time augmentation strength (0 = off); set on a training-only copy
         log.debug(f"LabeledWindows: {n_rows} rows, {len(self.sessions)} sessions"
                   f"{f' (patient {patient})' if patient is not None else ''}{f' (split {split})' if split else ''} in {time.time() - t0:.2f}s")
 
@@ -510,6 +522,10 @@ class LabeledWindows(Dataset):
         C, Ttot = arr.shape
         e = int(round(float(self._stop_times[i]) * self.fs))
         e = min(max(e, self.T), Ttot)
+        aug = float(getattr(self, "augment", 0.0))
+        if aug > 0:     # random shift of the window end by up to 0.5 s; the label is unchanged at that scale
+            sh = int(self.fs * 0.5)
+            e = min(max(e + int(torch.randint(-sh, sh + 1, ()).item()), self.T), Ttot)
 
         L = self.N * self.T
         if e - L >= 0:
@@ -519,6 +535,8 @@ class LabeledWindows(Dataset):
             if e > 0:
                 x_total[:, L - e:] = arr[:, :e]
             x_total = x_total.reshape(C, self.N, self.T)
+        if aug > 0:
+            x_total = _augment(x_total, aug)
 
         if hasattr(self.tok, "encode_blocks"):
             enc = self.tok.encode_blocks(x_total)

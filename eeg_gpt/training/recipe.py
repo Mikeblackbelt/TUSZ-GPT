@@ -210,14 +210,15 @@ def cpu_state(model: nn.Module) -> dict:
 # ----------------------------------------------------------------------------------------------- scores / thresholds
 
 @torch.no_grad()
-def collect_scores(model: nn.Module, loader, args: Any, device: torch.device):
-    """(scores, targets, valid) numpy arrays of the binary head over a loader."""
+def collect_scores(model: nn.Module, loader, args: Any, device: torch.device, with_meta: bool = False):
+    """(scores, targets, valid) numpy arrays of the binary head over a loader; with_meta adds
+    (session_idx, row_idx) for per-session smoothing."""
     was_training = model.training
     model.eval()
     kw = get_autocast_kwargs(device, args.amp)
     nb = device.type == "cuda"
     from eeg_gpt.training.finetune import _model_forward   # lazy: finetune imports this module
-    S, Y, V = [], [], []
+    S, Y, V, SID, R = [], [], [], [], []
     key = "horizon_pos" if getattr(args, "label", "preictal") == "horizon" else "occ"
     for b in loader:
         with torch.autocast(**kw):
@@ -225,11 +226,14 @@ def collect_scores(model: nn.Module, loader, args: Any, device: torch.device):
         S.append(torch.sigmoid(out["binary_logit"].float()).cpu())
         Y.append(b[key].float())
         V.append(b["occ_valid"].float())
+        if with_meta:
+            SID.append(b["session_idx"]); R.append(b["row_idx"].float())
     if was_training:
         model.train()
     if not S:
-        return np.zeros(0), np.zeros(0), np.zeros(0)
-    return torch.cat(S).numpy(), torch.cat(Y).numpy(), torch.cat(V).numpy()
+        return (np.zeros(0),) * (5 if with_meta else 3)
+    out = (torch.cat(S).numpy(), torch.cat(Y).numpy(), torch.cat(V).numpy())
+    return out + (torch.cat(SID).numpy(), torch.cat(R).numpy()) if with_meta else out
 
 
 def thresholds_from(scores, targets, spec: float = 0.90) -> dict:

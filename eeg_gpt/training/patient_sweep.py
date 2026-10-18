@@ -206,9 +206,16 @@ def generate_patient_cv_splits(
             train_sess = [s for s in sessions if s not in ev_set]
             val_set: set = set()
             if inner_val:
+                # >= 2 sessions so the validation AUROC ranks across sessions (one session's AUROC is that
+                # session's quirks, and it drove selection to epoch 1): 2 seizure sessions when >= 4 remain,
+                # else 1, plus one seizure-free session when there is one
                 cand = [s for s in train_sess if sess_pos[s] > 0]
+                negs = [s for s in train_sess if sess_pos[s] == 0]
                 if len(cand) >= 3:
-                    val_set = {cand[int(rng.integers(len(cand)))]}
+                    n_val = 2 if len(cand) >= 4 else 1
+                    val_set = {cand[int(j)] for j in rng.choice(len(cand), n_val, replace=False)}
+                    if negs:
+                        val_set.add(negs[int(rng.integers(len(negs)))])
             eval_idx = [i for i, s in enumerate(sess_col) if s in ev_set]
             val_idx = [i for i, s in enumerate(sess_col) if s in val_set]
             train_idx = [i for i, s in enumerate(sess_col) if s not in ev_set and s not in val_set]
@@ -744,7 +751,9 @@ def run_one_fold_training(
     type_on = recipe.type_head_enabled(getattr(args, "type_head", "on"), tr_ds.df)
     sampler = BalancedBatchSampler(tr_ds.df, args.batch_size, args.min_ictal_per_batch if type_on else 0,
                                    seed=args.seed + fold_idx, preictal_frac=getattr(args, "preictal_frac", 0.0))
-    tl = make_loader(tr_ds, batch_sampler=sampler, num_workers=args.num_workers)
+    tr_aug = copy.copy(tr_ds)              # augmentation on the training loader only (the diagnostic / baseline loaders share tr_ds)
+    tr_aug.augment = float(getattr(args, "augment", 0.0))
+    tl = make_loader(tr_aug, batch_sampler=sampler, num_workers=args.num_workers)
     eval_bs = args.eval_batch_size or 4 * args.batch_size
     el = make_loader(ev_ds, batch_size=eval_bs, num_workers=args.num_workers, shuffle=False)
     tl_eval = make_loader(tr_ds, batch_size=eval_bs, num_workers=args.num_workers, shuffle=False) if args.baseline else None
@@ -827,6 +836,8 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
     snaps: dict = {}                      # the last two epochs' weights on CPU (inner selection lags one epoch)
     oracle_epoch, oracle_auroc = None, -1.0
     selected, best_smooth = None, -float("inf")
+    fb_arg = int(getattr(args, "fallback_epoch", 0) or 0)
+    fallback_epoch = min(args.epochs, fb_arg if fb_arg > 0 else freeze_epochs + 2)
     baseline_auroc = None
 
     def save_best(ep):
@@ -910,8 +921,11 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
         e_stats = recipe.score_stats(S_e, Y_e)
         val_auroc = float("nan")
         if vl is not None:
-            S_v, Y_v, V_v = recipe.collect_scores(eval_model, vl, args, device); m = V_v > 0.5
-            val_sy[ep] = (S_v[m], Y_v[m]); val_auroc = auroc(S_v[m], Y_v[m])
+            S_v, Y_v, V_v, SID_v, T_v = recipe.collect_scores(eval_model, vl, args, device, with_meta=True); m = V_v > 0.5
+            val_sy[ep] = (S_v[m], Y_v[m])
+            k_sel = int(getattr(args, "select_smooth_k", 0))
+            val_auroc = (smoothed_auroc(SID_v[m], T_v[m], S_v[m], Y_v[m], k_sel)["auroc_smoothed"] if k_sel > 1
+                         else auroc(S_v[m], Y_v[m]))
         diag = {}
         if dl is not None:
             S_t, Y_t, V_t = recipe.collect_scores(eval_model, dl, args, device); m = V_t > 0.5
@@ -919,7 +933,9 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
             diag = {"train_auroc": auroc(S_t[m], Y_t[m]), "train_score_stats": recipe.score_stats(S_t[m], Y_t[m])}
         eval_res[ep] = res; eval_sy[ep] = (S_e, Y_e)
         eval_aurocs.append(eval_auroc); val_aurocs.append(val_auroc)
-        snaps[ep] = recipe.cpu_state(eval_model); snaps.pop(ep - 2, None)
+        snaps[ep] = recipe.cpu_state(eval_model)
+        if ep - 2 != fallback_epoch:
+            snaps.pop(ep - 2, None)
 
         # ---- selection
         if not math.isnan(eval_auroc) and eval_auroc > oracle_auroc:
@@ -934,8 +950,15 @@ def _fit_fold(tr_ds, ev_ds, model, args, device, fold_out_dir, sampler, tl, el, 
                 best_smooth, selected = sm[cand - 1], cand; save_best(cand)
             if ep == args.epochs and not math.isnan(sm[ep - 1]) and sm[ep - 1] > best_smooth:
                 best_smooth, selected = sm[ep - 1], ep; save_best(ep)
-            if ep == args.epochs and selected is None:
-                selected = ep; save_best(ep)
+            if ep == args.epochs:
+                sm_ok = [v_ for v_ in sm if not math.isnan(v_)]
+                flat = len(sm_ok) < 2 or (max(sm_ok) - min(sm_ok)) < getattr(args, "select_flat_tol", 0.02)
+                if selected is None or flat:
+                    fb = fallback_epoch if fallback_epoch in snaps else ep
+                    if flat:
+                        log.info(f"inner-val curve is flat (range < {getattr(args, 'select_flat_tol', 0.02)}): "
+                                 f"selecting the fallback epoch {fb} instead of {selected}")
+                    selected = fb; save_best(fb)
         else:
             if ep == args.epochs:
                 selected = ep; save_best(ep)
@@ -1415,7 +1438,7 @@ def build_parser():
     p.add_argument("--steps-per-epoch", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--accum", type=int, default=4)
-    p.add_argument("--lr", type=float, default=1e-5, help="trunk lr at the top block after unfreezing (see --llrd)")
+    p.add_argument("--lr", type=float, default=5e-6, help="trunk lr at the top block after unfreezing (see --llrd)")
     p.add_argument("--head-lr", type=float, default=3e-4)
     p.add_argument("--warmup-frac", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.1)
@@ -1444,7 +1467,7 @@ def build_parser():
     # --- recipe flags (owner: recipe implementer; insert new add_argument lines directly below this marker) ---
     p.add_argument("--preictal-frac", type=float, default=0.10, help="fraction of every training batch reserved for preictal rows (0 = none reserved, today's sampler)")
     p.add_argument("--pos-weight", default="auto", help="'auto' = background / preictal per batch after balancing (capped by --pos-weight-cap), or a fixed number")
-    p.add_argument("--freeze-epochs", type=int, default=3, help="LP-FT: epochs with the trunk frozen before unfreezing it with layer-wise lr decay (0 = train everything from epoch 1)")
+    p.add_argument("--freeze-epochs", type=int, default=5, help="LP-FT: epochs with the trunk frozen before unfreezing it with layer-wise lr decay (0 = train everything from epoch 1)")
     p.add_argument("--llrd", type=float, default=0.65, help="layer-wise lr decay of the trunk after unfreezing: block i of L gets --lr * llrd^(L-1-i), embeddings --lr * llrd^L (1 = off)")
     p.add_argument("--agg-lr", type=float, default=1e-4, help="lr of the channel aggregator / temporal context (everything that is neither trunk nor head)")
     p.add_argument("--backbone-dropout", type=float, default=0.1, help="dropout inside the pretrained trunk during fine-tuning (it was pretrained with 0)")
@@ -1452,6 +1475,13 @@ def build_parser():
     p.add_argument("--type-head", choices=["auto", "on", "off"], default="auto", help="auto = off when the training fold has < 2 seizure types")
     p.add_argument("--select", choices=["inner", "none", "oracle"], default="inner",
                    help="epoch selection: inner validation split (falls back to none without one), last epoch, or max on the eval fold (optimistic; always reported as auroc_oracle)")
+    p.add_argument("--augment", type=float, default=0.1,
+                   help="training augmentation strength: per-channel amplitude scale +-x, white noise x/2 of channel sd, window shift <= 0.5 s (0 = off)")
+    p.add_argument("--select-smooth-k", type=int, default=15,
+                   help="inner selection on the per-session moving-averaged val AUROC over this many windows (<= 1 = raw AUROC)")
+    p.add_argument("--fallback-epoch", type=int, default=0,
+                   help="epoch chosen when the inner-val curve is flat or missing (0 = --freeze-epochs + 2)")
+    p.add_argument("--select-flat-tol", type=float, default=0.02, help="inner-val curve range below which it counts as flat")
     # --- protocol flags (owner: protocol implementer; insert new add_argument lines directly below this marker) ---
     p.add_argument("--postictal-exclude-s", type=float, default=0.0,
                    help="seconds after the end of a seizure whose rows are not scored as background (occ_valid 0); 0 = off")
