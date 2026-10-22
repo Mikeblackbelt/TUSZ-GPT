@@ -143,17 +143,24 @@ def param_groups(model: nn.Module, args: Any) -> list:
         else:
             agg.append(p)
     groups = []
-    if heads:
-        groups.append({"params": heads, "lr": head_lr, "name": "heads", "weight_decay": wd})
-    if agg:
-        groups.append({"params": agg, "lr": agg_lr, "name": "agg", "weight_decay": wd})
+
+    def add(params, lr_, name):
+        # biases / norm gains (ndim < 2) are not decayed: decaying the head's LayerNorm gain and the
+        # binary bias shrinks the logit to a constant, which starves the trunk of gradient (the collapse)
+        dec = [p for p in params if p.ndim >= 2]
+        nod = [p for p in params if p.ndim < 2]
+        if dec:
+            groups.append({"params": dec, "lr": lr_, "name": name, "weight_decay": wd})
+        if nod:
+            groups.append({"params": nod, "lr": lr_, "name": f"{name}.nodecay", "weight_decay": 0.0})
+
+    add(heads, head_lr, "heads")
+    add(agg, agg_lr, "agg")
     L = (max(layers) + 1) if layers else 0
-    if top:
-        groups.append({"params": top, "lr": lr, "name": "trunk.top", "weight_decay": wd})
+    add(top, lr, "trunk.top")
     for i in sorted(layers):
-        groups.append({"params": layers[i], "lr": lr * llrd ** (L - 1 - i), "name": f"trunk.block{i}", "weight_decay": wd})
-    if emb:
-        groups.append({"params": emb, "lr": lr * llrd ** L, "name": "trunk.emb", "weight_decay": wd})
+        add(layers[i], lr * llrd ** (L - 1 - i), f"trunk.block{i}")
+    add(emb, lr * llrd ** L, "trunk.emb")
     return groups
 
 

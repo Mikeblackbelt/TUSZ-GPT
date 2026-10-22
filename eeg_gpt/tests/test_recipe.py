@@ -74,6 +74,9 @@ def test_init_heads_and_groups():
     assert names["heads"] == 1e-3 and names["agg"] == 3e-4
     assert abs(names["trunk.block1"] - 1e-5) < 1e-12 and abs(names["trunk.block0"] - 0.5e-5) < 1e-12
     assert abs(names["trunk.emb"] - 0.25e-5) < 1e-12
+    # biases / norm gains are never decayed (decaying the head LN gain + bias collapses the logit to a constant)
+    assert all(g["weight_decay"] == 0.0 for g in groups if any(p.ndim < 2 for p in g["params"]))
+    assert names["heads.nodecay"] == 1e-3
     n_params = sum(p.numel() for g in groups for p in g["params"])
     assert n_params == sum(p.numel() for p in {id(p): p for p in m.parameters()}.values())
     # frozen trunk => no trunk groups
