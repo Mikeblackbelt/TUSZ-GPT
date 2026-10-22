@@ -461,9 +461,10 @@ def run_pretrain(args, train_sessions=None, val_sessions=None) -> dict:
                     args.label_smoothing,
                     args.aux_weight,
                     args.spec_weight,
+                    compute_floors=(step % 50 == 49),
                 )
             scaler.scale(out["loss"] / args.accum).backward()
-        scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
         scaler.step(opt); scaler.update(); step += 1
         if step % 50 == 0:
             # the only GPU sync of the training loop: metrics of the last micro-batch

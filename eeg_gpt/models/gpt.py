@@ -348,7 +348,7 @@ def _patch_floors(z: torch.Tensor, patch: int) -> dict:
 
 def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torch.Tensor, tokenizer,
              lambda_mse: float = 0.1, label_smoothing: float = 0.0, aux_weight: float = 1.0,
-             spec_weight: float = 1.0) -> dict:
+             spec_weight: float = 1.0, compute_floors: bool = True) -> dict:
     """Token path -- tokens/z: (B, block+1). Input = tokens[:, :-1]; the head for offset o at
     position t predicts tokens[:, t+o]. CE on every offset (offsets > 1 weighted
     by aux_weight); composite cross-entropy is normalized by the sum of CE head weights;
@@ -368,7 +368,7 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
     on the token path; `mse_copy_patch`, `mse_ar8` on the patch path).
     """
     if getattr(model, "objective", "token") == "patch":
-        return _patch_loss(model, tokens, z, channel, aux_weight, spec_weight)
+        return _patch_loss(model, tokens, z, channel, aux_weight, spec_weight, compute_floors=compute_floors)
     inp = tokens[:, :-1]
     logits, _ = model(inp, channel)
     T = inp.shape[1]
@@ -387,8 +387,9 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
         w_o = 1.0 if o == 1 else aux_weight
         ce_loss_sum = ce_loss_sum + w_o * opt_ce
         ce_weight_sum += w_o
-        with torch.no_grad():
-            out[f"acc@{o}"] = (lg.argmax(-1) == tgt).float().mean()
+        if compute_floors:
+            with torch.no_grad():
+                out[f"acc@{o}"] = (lg.argmax(-1) == tgt).float().mean()
         if o == 1 and lambda_mse > 0:
             p = lg.float().softmax(-1)
             if getattr(model, "mse_units", "sigma") == "bin":
@@ -404,13 +405,14 @@ def gpt_loss(model: EEGGPT, tokens: torch.Tensor, z: torch.Tensor, channel: torc
         out["loss"] = ce_loss_sum
     if "mse" in out and lambda_mse > 0:
         out["loss"] = out["loss"] + lambda_mse * out["mse"]
-    with torch.no_grad():
-        out.update(_token_floors(tokens, z, tokenizer))
+    if compute_floors:
+        with torch.no_grad():
+            out.update(_token_floors(tokens, z, tokenizer))
     return out
 
 
 def _patch_loss(model: EEGGPT, zseq: torch.Tensor, z: torch.Tensor, channel: torch.Tensor,
-                aux_weight: float, spec_weight: float) -> dict:
+                aux_weight: float, spec_weight: float, compute_floors: bool = True) -> dict:
     k = model.patch
     zf = zseq.float()
     B, Tp = zf.shape
@@ -431,8 +433,9 @@ def _patch_loss(model: EEGGPT, zseq: torch.Tensor, z: torch.Tensor, channel: tor
         m = F.mse_loss(pr, tg)
         out[f"mse_coarse@{hz}"] = m
         out["loss"] = out["loss"] + aux_weight * m
-    with torch.no_grad():
-        out.update(_patch_floors(zf, k))
+    if compute_floors:
+        with torch.no_grad():
+            out.update(_patch_floors(zf, k))
     return out
 
 def focal_bce(logits: torch.Tensor, targets: torch.Tensor, gamma: float = 2.0,
