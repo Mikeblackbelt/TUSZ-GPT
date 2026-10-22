@@ -37,13 +37,13 @@ def test_from_config_roundtrip():
     torch.manual_seed(1)
     t, z, ch = torch.randint(0, 64, (2, 257)), torch.randn(2, 257), torch.tensor([0, 5])
     a, b = gpt_loss(old, t, z, ch, tok, 0.5, 0.0, 0.5), gpt_loss(new, t, z, ch, tok, 0.5, 0.0, 0.5)
-    assert abs(float(a["loss"]) - float(b["loss"])) < 1e-5 and abs(float(a["ce@1"]) - float(b["ce@1"])) < 1e-6
+    assert abs(float(a["loss"].detach()) - float(b["loss"].detach())) < 1e-5 and abs(float(a["ce@1"].detach()) - float(b["ce@1"].detach())) < 1e-6
     for k in ("ce_copy", "acc_copy", "ce_ar8", "mse_ar8"):
         assert k in b and np.isfinite(float(b[k])), k
     # the options that change the token path are off by default and reachable
     m = EEGGPT.from_config({**old_cfg, "tie_mode": "full", "dequant": "center", "mse_units": "bin"})
     out = gpt_loss(m, t, z, ch, AmplitudeTokenizer.from_config({**old_cfg, "dequant": "center"}), 0.5, 0.0, 0.5)
-    assert np.isfinite(float(out["loss"]))
+    assert np.isfinite(float(out["loss"].detach()))
     print("stage1: from_config round trip ok")
 
 

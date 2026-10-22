@@ -53,6 +53,20 @@ def synthetic_master(path: str, patient: str = "aaaaaaaa", n_sessions: int = 6, 
     return path
 
 
+try:
+    import pytest
+
+    @pytest.fixture
+    def csv(tmp_path):
+        return synthetic_master(str(tmp_path / "m1.csv"), "aaaaaaaa", n_sessions=6, seizures_per_session=1)
+
+    @pytest.fixture
+    def csv2(tmp_path):
+        return synthetic_master(str(tmp_path / "m2.csv"), "bbbbbbbb", n_sessions=2, seizures_per_session=3, session_s=5400.0)
+except ImportError:
+    pass
+
+
 def labeled_frame(csv: str, patient: str) -> pd.DataFrame:
     """What LabeledWindows.df looks like for one patient: bg/preictal/ictal rows, sorted, positional index."""
     df = load_master(csv)
