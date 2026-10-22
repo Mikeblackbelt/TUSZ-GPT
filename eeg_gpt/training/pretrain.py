@@ -144,6 +144,8 @@ def build_parser():
     p.add_argument("--probe-windows", type=int, default=600, help="labelled windows for the probe (class-balanced), split by session into train/test halves")
     p.add_argument("--probe-every", type=int, default=None, help="steps between probes (default: --val-every)")
     p.add_argument("--eval-only", default=None, help="checkpoint: build the model from its config, log the validation metrics, floors and probe, write <out>/eval.json, and exit")
+    p.add_argument("--drop-path", type=float, default=0.0,
+                   help="stochastic depth rate (per block, linearly scaled with depth; 0 = off). Adds regularization for long runs (>50k steps); try 0.05-0.1.")
     return p
 
 
@@ -423,7 +425,7 @@ def run_pretrain(args, train_sessions=None, val_sessions=None) -> dict:
              f"({model.n_positions} positions of {args.block_size} samples) | norm_scope {args.norm_scope} | "
              f"offsets {list(model.pred_offsets)} | levels {args.n_levels} | clip_k {args.clip_k} | selection on {sel_key}")
     log.info(f"  rope={args.rope} | value_emb={args.value_emb} | tie_weights={args.tie_weights} | tie_mode={args.tie_mode} | "
-             f"dequant={args.dequant} | mse_units={args.mse_units} | dropout={args.dropout} | lambda_mse={args.lambda_mse} | "
+             f"dequant={args.dequant} | mse_units={args.mse_units} | dropout={args.dropout} | drop_path={getattr(args, 'drop_path', 0.0)} | lambda_mse={args.lambda_mse} | "
              f"aux_weight={args.aux_weight} | spec_weight={args.spec_weight} | coarse_horizons={args.coarse_horizons!r} | "
              f"label_smoothing={args.label_smoothing} | warmup={args.warmup} | lr_min={args.lr_min} | "
              f"probe={'every %d steps on %s' % (args.probe_every, args.probe_csv) if args.probe_csv else 'off'}")

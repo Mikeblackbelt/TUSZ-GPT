@@ -114,13 +114,14 @@ class EEGGPT(nn.Module):
     CONFIG_DEFAULTS = dict(n_levels=512, n_channels=20, d=256, layers=6, heads=4, ffn=1024, block_size=1024,
                            pred_offsets="1,8,32", rope=True, value_emb=True, tie_weights=True, dropout=0.0,
                            patch=1, objective="token", norm_scope="block", causal=True, tie_mode="tok",
-                           dequant="edge", mse_units="sigma", n_bands=8, coarse_horizons="")
+                           dequant="edge", mse_units="sigma", n_bands=8, coarse_horizons="", drop_path=0.0)
 
     def __init__(self, n_levels: int = 512, n_channels: int = 20, d: int = 128, layers: int = 4, heads: int = 4,
                  ffn: int = 512, block_size: int = 1024, dropout: float = 0.1, pred_offsets: Sequence[int] = (1,),
                  rope: bool = False, value_emb: bool = False, tie_weights: bool = False, n_value_freqs: int = 8,
                  patch: int = 1, objective: str = "auto", causal: bool = True, tie_mode: str = "tok",
-                 dequant: str = "edge", mse_units: str = "sigma", n_bands: int = 8, coarse_horizons=()):
+                 dequant: str = "edge", mse_units: str = "sigma", n_bands: int = 8, coarse_horizons=(),
+                 drop_path: float = 0.0):
         super().__init__()
         self.L, self.d, self.block_size = n_levels, d, block_size
         self.patch = max(1, int(patch))
@@ -159,7 +160,9 @@ class EEGGPT(nn.Module):
             self.register_buffer("val_feats", torch.cat([u, torch.sin(u * f), torch.cos(u * f)], dim=-1), persistent=False)
             self.val_proj = nn.Linear(self.val_feats.shape[1], d)
         self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([Block(d, heads, ffn, dropout, n_pos if rope else 0) for _ in range(layers)])
+        # stochastic depth rate linearly increases from 0 to drop_path with depth (same as timm / DeiT)
+        dp_rates = [drop_path * i / max(1, layers - 1) for i in range(layers)]
+        self.blocks = nn.ModuleList([Block(d, heads, ffn, dropout, n_pos if rope else 0, dp_rates[i]) for i in range(layers)])
         self.ln_f = nn.LayerNorm(d)
         if self.patch == 1:
             self.pred_offsets = tuple(int(o) for o in pred_offsets)
@@ -195,7 +198,7 @@ class EEGGPT(nn.Module):
                    rope=bool(g("rope")), value_emb=bool(g("value_emb")), tie_weights=bool(g("tie_weights")),
                    patch=patch, objective=objective, causal=bool(g("causal")), tie_mode=g("tie_mode") or "tok",
                    dequant=g("dequant") or "edge", mse_units=g("mse_units") or "sigma", n_bands=int(g("n_bands") or 8),
-                   coarse_horizons=g("coarse_horizons") or "")
+                   coarse_horizons=g("coarse_horizons") or "", drop_path=float(g("drop_path") or 0.0))
 
     @staticmethod
     def _init(m):
