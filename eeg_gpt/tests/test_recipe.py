@@ -63,9 +63,9 @@ def test_init_heads_and_groups():
     m = SeizureModel(bb, 4, 2, context_blocks=2, dropout=0.1)
     init_heads(m, 0.2, [30, 10])
     lin = [x for x in m.binary_head.modules() if isinstance(x, torch.nn.Linear)][-1]
-    assert float(lin.weight.abs().sum()) == 0.0 and abs(float(lin.bias) - math.log(0.2 / 0.8)) < 1e-6
+    assert float(lin.weight.detach().abs().sum()) == 0.0 and abs(float(lin.bias.detach()) - math.log(0.2 / 0.8)) < 1e-6
     tl = [x for x in m.type_head.modules() if isinstance(x, torch.nn.Linear)][-1]
-    assert abs(float(tl.bias[0]) - math.log(0.75)) < 1e-6 and abs(float(tl.bias[1]) - math.log(0.25)) < 1e-6
+    assert abs(float(tl.bias.detach()[0]) - math.log(0.75)) < 1e-6 and abs(float(tl.bias.detach()[1]) - math.log(0.25)) < 1e-6
 
     class A:  # minimal args
         head_lr, agg_lr, lr, llrd = 1e-3, 3e-4, 1e-5, 0.5
@@ -74,8 +74,9 @@ def test_init_heads_and_groups():
     assert names["heads"] == 1e-3 and names["agg"] == 3e-4
     assert abs(names["trunk.block1"] - 1e-5) < 1e-12 and abs(names["trunk.block0"] - 0.5e-5) < 1e-12
     assert abs(names["trunk.emb"] - 0.25e-5) < 1e-12
-    # biases / norm gains are never decayed (decaying the head LN gain + bias collapses the logit to a constant)
+    # biases / norm gains / heads are never decayed (decaying the head LN gain, bias, or weights collapses the logit to a constant)
     assert all(g["weight_decay"] == 0.0 for g in groups if any(p.ndim < 2 for p in g["params"]))
+    assert all(g["weight_decay"] == 0.0 for g in groups if g["name"].startswith("heads"))
     assert names["heads.nodecay"] == 1e-3
     n_params = sum(p.numel() for g in groups for p in g["params"])
     assert n_params == sum(p.numel() for p in {id(p): p for p in m.parameters()}.values())

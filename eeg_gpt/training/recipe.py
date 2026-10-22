@@ -145,12 +145,15 @@ def param_groups(model: nn.Module, args: Any) -> list:
     groups = []
 
     def add(params, lr_, name):
-        # biases / norm gains (ndim < 2) are not decayed: decaying the head's LayerNorm gain and the
-        # binary bias shrinks the logit to a constant, which starves the trunk of gradient (the collapse)
+        # Biases and norm gains (ndim < 2) are not decayed: decaying the head's LayerNorm gain and the
+        # binary bias shrinks the logit to a constant, which starves the trunk of gradient (the collapse).
+        # Heads are also never decayed: decaying the linear head weight shrinks W -> 0, which also collapses
+        # the logit to a constant (W*x + b -> b, score std ~0.001, frac>0.5 ~ 0.0000) and starves the trunk of gradient.
         dec = [p for p in params if p.ndim >= 2]
         nod = [p for p in params if p.ndim < 2]
+        head_wd = 0.0 if name.startswith("heads") else wd
         if dec:
-            groups.append({"params": dec, "lr": lr_, "name": name, "weight_decay": wd})
+            groups.append({"params": dec, "lr": lr_, "name": name, "weight_decay": head_wd})
         if nod:
             groups.append({"params": nod, "lr": lr_, "name": f"{name}.nodecay", "weight_decay": 0.0})
 
